@@ -40,6 +40,14 @@
 > un chat_id de Telegram real) que ahora viaja en `POST /chat`/`/chat/stream`.
 > Detalle en la sección **6** (Uso en tiempo real) y la nueva sección **9.5**
 > (Deduplicación de notificaciones de riesgo).
+>
+> **Cuarta nota (24-ago-2026):** se agregó una segunda capa de aceptación,
+> secuencial a la del aviso de tratamiento de datos: **Términos y
+> Condiciones de uso** (`TERMS_TEXT` en `src/consent.py`), marcada
+> explícitamente como **BORRADOR — PENDIENTE DE REVISIÓN LEGAL**. Ninguna
+> sesión (Streamlit o Telegram) puede chatear sin aceptar ambas capas en
+> orden; rechazar cualquiera de las dos termina la sesión. Detalle completo
+> en la nueva sección **1.5**.
 
 ---
 
@@ -68,6 +76,56 @@ La arquitectura está diseñada para operar con costo marginal cercano a cero (A
 | Orquestación LLM | LangChain | 0.3.13 |
 | Evaluación | Ragas | 0.2.12 |
 | Validación config | Pydantic Settings | 2.14.1 |
+
+---
+
+## 1.5 Tratamiento de Datos y Términos y Condiciones
+
+Antes de que una sesión nueva (Streamlit o Telegram) pueda enviar **cualquier** mensaje, debe aceptar **dos capas secuenciales**, en este orden. Ambas viven en `src/consent.py` — fuente única compartida por la UI y el bot, texto en plano (sin markdown) para que se renderice igual en las dos plataformas.
+
+```mermaid
+sequenceDiagram
+    actor U as Usuario
+    participant GATE as consent_gate.py (Streamlit)<br/>o maternas_bot.py (Telegram)
+
+    U->>GATE: primer mensaje de la sesión
+    GATE->>U: Capa 1 — CONSENT_TEXT<br/>(tratamiento de datos)
+    alt Rechaza
+        GATE->>U: FAREWELL_TEXT — sesión terminada
+        Note over GATE: próximo mensaje vuelve a mostrar la Capa 1
+    else Acepta
+        GATE->>U: Capa 2 — TERMS_TEXT<br/>(Términos y Condiciones, BORRADOR)
+        alt Rechaza
+            GATE->>U: FAREWELL_TEXT — sesión terminada
+            Note over GATE: próximo mensaje vuelve a mostrar la Capa 1
+        else Acepta
+            GATE->>U: Chat habilitado
+        end
+    end
+```
+
+### Capa 1 — Aviso de tratamiento de información (`CONSENT_TEXT`)
+
+Explica, en lenguaje llano: que el proyecto está en fase experimental y no sustituye a un profesional; qué datos se conservan (alias + código interno, nunca nombre legal/documento/dirección/contraseñas); que la conversación se procesa para dar contexto al diálogo y a los fines de investigación, con anonimización/seudonimización si se usa en publicaciones; que la participación es voluntaria y el retiro de información se puede solicitar en cualquier momento; y una advertencia explícita de que es un prototipo, "aún no apto para uso clínico, comercial o productivo real".
+
+### Capa 2 — Términos y Condiciones de uso (`TERMS_TEXT`) — **BORRADOR**
+
+Se muestra **únicamente después de aceptar la Capa 1**, nunca antes ni en paralelo. A diferencia de la Capa 1 (ya estable), este texto está encabezado explícitamente como **"BORRADOR — PENDIENTE DE REVISIÓN LEGAL"**: es una especificación funcional razonable (naturaleza del proyecto, ausencia de garantías, límite de responsabilidad, uso aceptable, propiedad del contenido generado, posibilidad de cambios), no un documento legal definitivo. No debe activarse en un despliegue productivo sin la revisión y aprobación de las instancias jurídicas y éticas correspondientes — mismo requisito que ya exige el README en su sección **"Advertencia de uso y puesta en producción"** (ver más abajo).
+
+### Mecánica de aceptación/rechazo
+
+| Plataforma | Implementación | Estado por sesión |
+|---|---|---|
+| **Streamlit** | `src/ui/consent_gate.py` — dos `st.dialog()` secuenciales, `enforce_consent()` bloquea con `st.stop()` hasta que ambas capas estén `"accepted"` | `st.session_state.consent_status` / `.terms_status` — se pierde en cada sesión de navegador nueva (incluye un refresh duro) |
+| **Telegram** | `src/bot/maternas_bot.py` — dos mensajes con `InlineKeyboardMarkup` secuenciales (`consent_callback` → `terms_callback`), `handle_message()`/`handle_non_text()` verifican ambas antes de procesar cualquier turno | `consent_status` / `terms_status` — dicts en memoria por `hash(user_id)`, `_end_session()` centraliza la limpieza compartida al rechazar |
+
+**Rechazar cualquiera de las dos capas termina la sesión por completo** (no solo esa capa): se limpia el historial conversacional, se da de baja del scheduler de riesgo (`active_users.py`) y se cierra la sesión de métricas de uso (`usage_sessions.py`, ver sección 6). El próximo mensaje del usuario vuelve a mostrar la Capa 1 desde cero — nunca reanuda a mitad de camino con una sola capa aceptada de una sesión anterior.
+
+`/start` y `/reset` en Telegram fuerzan la re-aceptación de ambas capas aunque ya se hubieran aceptado antes, tratando el comando como el inicio de una sesión nueva.
+
+### Advertencia de uso y puesta en producción
+
+El **README** (sección homónima) es la fuente autoritativa de esta advertencia — se resume acá para que quede enlazada desde el flujo de consentimiento: *"Este software corresponde a un prototipo desarrollado con fines de investigación (...) no implica que se encuentre autorizado para operar como servicio productivo, comercial, clínico, psicológico, educativo o institucional."* El README enumera además una checklist mínima de 10 puntos que la organización responsable debe cubrir antes de producción (política de tratamiento de datos, aviso de privacidad, evaluación de impacto en privacidad, revisión jurídica y ética, entre otros) — la Capa 2 (T&C) de esta sección es un primer borrador funcional hacia ese requisito, no un sustituto de él.
 
 ---
 
@@ -177,6 +235,7 @@ flowchart TD
 maternas-rag/
 ├── src/                          # Código fuente principal
 │   ├── settings.py               # Configuración central (Pydantic Settings, lee .env)
+│   ├── consent.py                # Textos de las 2 capas (datos + T&C), compartidos UI/bot — ver sección 1.5
 │   ├── api/
 │   │   ├── main.py               # FastAPI app: lifespan, /chat, /chat/stream, /classify, /health
 │   │   ├── schemas.py            # Modelos Pydantic de request/response
@@ -218,7 +277,7 @@ maternas-rag/
 │   │   ├── app.py                # Entrypoint Streamlit: gates, sidebar, st.navigation
 │   │   ├── client.py             # Cliente HTTP hacia la API (sin lógica de presentación)
 │   │   ├── admin_gate.py         # Desbloquea las páginas admin dentro de la sesión (X-Admin-Token)
-│   │   ├── consent_gate.py       # Exige el aviso de tratamiento de datos antes de usar cualquier página
+│   │   ├── consent_gate.py       # Exige las 2 capas (datos + T&C) antes de usar cualquier página
 │   │   └── views/                # chat, dashboard, documents, metrics, config, console
 │   └── skills/
 │       ├── __init__.py           # ToolSpec, ToolRegistry, Skill base
@@ -1370,4 +1429,4 @@ No existe pipeline de CI/CD, Dockerfile ni configuración de despliegue en el re
 
 ---
 
-*Documentación generada en Julio 2026, ampliada en Agosto 2026 (panel de administración, configuración editable, supervisor del bot, streaming + citas por documento; migración a `gpt-oss-120b`; uso en tiempo real y deduplicación de notificaciones de riesgo por episodio). Verificada contra el código fuente del commit `787426e` (24-ago-2026).*
+*Documentación generada en Julio 2026, ampliada en Agosto 2026 (panel de administración, configuración editable, supervisor del bot, streaming + citas por documento; migración a `gpt-oss-120b`; uso en tiempo real y deduplicación de notificaciones de riesgo por episodio; segunda capa de Términos y Condiciones tras el aviso de tratamiento de datos). Verificada contra el código fuente al 24-ago-2026.*

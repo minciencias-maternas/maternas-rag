@@ -15,13 +15,16 @@ Arrancar:
 Comandos:
     /start  — muestra el aviso de tratamiento de datos (nueva sesion)
     /help   — instrucciones de uso
-    /reset  — reinicia la conversacion y vuelve a exigir el aviso de datos
+    /reset  — reinicia la conversacion y vuelve a exigir ambas capas
     /stats  — info del sistema (vectores indexados)
 
-Toda sesion nueva (bot recien iniciado, /start o /reset) exige aceptar el
-aviso de tratamiento de datos (src/consent.py) antes de procesar cualquier
-mensaje. Si el usuario no acepta, no se le responde como chat: cualquier
-mensaje nuevo vuelve a mostrarle el aviso.
+Toda sesion nueva (bot recien iniciado, /start o /reset) exige aceptar DOS
+capas SECUENCIALES (src/consent.py) antes de procesar cualquier mensaje:
+1. aviso de tratamiento de datos (CONSENT_TEXT), y
+2. Terminos y Condiciones de uso (TERMS_TEXT) — recien despues de aceptar
+   la capa 1.
+Si el usuario rechaza cualquiera de las dos, la sesion termina: cualquier
+mensaje nuevo vuelve a mostrar la capa 1 desde cero.
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ from telegram.ext import (
     filters,
 )
 from src.settings import settings
-from src.consent import ACCEPTED_TEXT, CONSENT_TEXT, FAREWELL_TEXT
+from src.consent import CONSENT_TEXT, FAREWELL_TEXT, TERMS_ACCEPTED_TEXT, TERMS_TEXT
 
 from src.bot.active_users import (
     register as register_active_user,
@@ -123,13 +126,20 @@ def _new_usage_session(user_id: int) -> None:
     usage_session_ids[_hash_id(user_id)] = str(uuid.uuid4())
 
 # ---------------------------------------------------------------------------
-# Consentimiento de tratamiento de datos: { hash(user_id): "accepted" | "rejected" }
+# Consentimiento de tratamiento de datos + Términos y Condiciones:
+# { hash(user_id): "accepted" | "rejected" } — dos dicts, dos capas
+# SECUENCIALES (primero consent_status, recién después terms_status).
 # Toda nueva sesión (bot recién iniciado, /start o /reset) empieza sin
-# entrada aquí — se exige mostrar el aviso y obtener aceptación explícita
+# entrada en ninguno de los dos — se exige aceptación explícita de ambos
 # antes de procesar cualquier mensaje. En RAM únicamente, no se persiste.
 # ---------------------------------------------------------------------------
 
 consent_status: dict[str, str] = {}
+terms_status: dict[str, str] = {}
+
+
+def _is_fully_accepted(key: str) -> bool:
+    return consent_status.get(key) == "accepted" and terms_status.get(key) == "accepted"
 
 
 def _consent_keyboard() -> InlineKeyboardMarkup:
@@ -139,8 +149,38 @@ def _consent_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
+def _terms_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Acepto", callback_data="terms_accept"),
+        InlineKeyboardButton("❌ No acepto", callback_data="terms_reject"),
+    ]])
+
+
 async def _send_consent_prompt(update: Update) -> None:
     await update.message.reply_text(CONSENT_TEXT, reply_markup=_consent_keyboard())
+
+
+async def _send_terms_prompt(update: Update) -> None:
+    await update.message.reply_text(TERMS_TEXT, reply_markup=_terms_keyboard())
+
+
+async def _send_next_prompt(update: Update, key: str) -> None:
+    """Muestra la capa que falta aceptar — datos primero, T&C después."""
+    if consent_status.get(key) != "accepted":
+        await _send_consent_prompt(update)
+    else:
+        await _send_terms_prompt(update)
+
+
+def _end_session(key: str, user_id: int) -> None:
+    """Limpieza compartida al rechazar cualquiera de las dos capas, o al
+    empezar una sesión nueva (/start, /reset): ambos estados de
+    aceptación, historial, scheduler de riesgo y sesión de métricas."""
+    consent_status.pop(key, None)
+    terms_status.pop(key, None)
+    histories.pop(key, None)
+    remove_active_user(user_id)
+    usage_session_ids.pop(key, None)
 
 # ---------------------------------------------------------------------------
 # Flag de salud de la API (para el scheduler)
@@ -197,10 +237,11 @@ WELCOME_TEXT = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # /start siempre marca el inicio de una nueva sesión — se exige
-    # aceptar el aviso de tratamiento de datos de nuevo, aunque ya se
-    # hubiera aceptado antes.
+    # aceptar de nuevo AMBAS capas (datos, luego T&C), aunque ya se
+    # hubieran aceptado antes.
     key = _hash_id(update.effective_user.id)
     consent_status.pop(key, None)
+    terms_status.pop(key, None)
     _new_usage_session(update.effective_user.id)
     await _send_consent_prompt(update)
 
@@ -214,16 +255,30 @@ async def consent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if query.data == "consent_accept":
         consent_status[key] = "accepted"
-        await query.edit_message_text(ACCEPTED_TEXT, reply_markup=None)
+        # Capa 1 aceptada -> mostrar la capa 2 (T&C) a continuación, en el
+        # mismo mensaje editado; el chat todavía no se habilita.
+        await query.edit_message_text(TERMS_TEXT, reply_markup=_terms_keyboard())
+    else:
+        _end_session(key, user.id)
+        await query.edit_message_text(FAREWELL_TEXT, reply_markup=None)
+
+
+async def terms_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    key = _hash_id(user.id)
+
+    if query.data == "terms_accept":
+        terms_status[key] = "accepted"
+        await query.edit_message_text(TERMS_ACCEPTED_TEXT, reply_markup=None)
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=f"¡Hola {user.first_name}! 🤰\n\n{WELCOME_TEXT}",
         )
     else:
-        consent_status[key] = "rejected"
-        histories.pop(key, None)
-        remove_active_user(user.id)
-        usage_session_ids.pop(key, None)
+        _end_session(key, user.id)
         await query.edit_message_text(FAREWELL_TEXT, reply_markup=None)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -251,8 +306,9 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del histories[key]
     # Dar de baja del scheduler — /reset también detiene los check-ins automáticos
     remove_active_user(user_id)
-    # /reset también cuenta como nueva sesión — se vuelve a exigir el aviso
+    # /reset también cuenta como nueva sesión — se vuelven a exigir AMBAS capas
     consent_status.pop(key, None)
+    terms_status.pop(key, None)
     _new_usage_session(user_id)
     await _send_consent_prompt(update)
 
@@ -284,10 +340,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text:
         return
 
-    # Sin aceptación vigente (nunca se pidió, o el usuario la rechazó antes):
-    # cualquier mensaje nuevo vuelve a mostrar el aviso en vez de procesarse.
-    if consent_status.get(_hash_id(user_id)) != "accepted":
-        await _send_consent_prompt(update)
+    # Sin aceptación vigente de AMBAS capas (nunca se pidió, o el usuario
+    # rechazó alguna antes): cualquier mensaje nuevo vuelve a mostrar la
+    # capa que falte, en vez de procesarse.
+    key_gate = _hash_id(user_id)
+    if not _is_fully_accepted(key_gate):
+        await _send_next_prompt(update, key_gate)
         return
 
     # Indicador de escritura
@@ -332,8 +390,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(answer[:4000])
 
 async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if consent_status.get(_hash_id(update.effective_user.id)) != "accepted":
-        await _send_consent_prompt(update)
+    key = _hash_id(update.effective_user.id)
+    if not _is_fully_accepted(key):
+        await _send_next_prompt(update, key)
         return
     await update.message.reply_text(
         "Solo entiendo mensajes de texto. Por favor escribe tu pregunta."
@@ -457,6 +516,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(consent_callback, pattern="^consent_"))
+    app.add_handler(CallbackQueryHandler(terms_callback, pattern="^terms_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(~filters.TEXT, handle_non_text))
     app.add_error_handler(error_handler)

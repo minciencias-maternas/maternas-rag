@@ -61,6 +61,8 @@ if "api_ok" not in st.session_state:
     st.session_state.api_ok = None
 if "consent_status" not in st.session_state:
     st.session_state.consent_status = None   # None | "accepted" | "rejected"
+if "terms_status" not in st.session_state:
+    st.session_state.terms_status = None     # None | "accepted" | "rejected" — capa 2, tras consent_status
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 if "admin_token" not in st.session_state:
