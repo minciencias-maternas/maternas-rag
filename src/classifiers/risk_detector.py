@@ -179,7 +179,18 @@ def _check_heuristic(message: str) -> Optional[RiskResult]:
 # Capa 2: LLM (Groq)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """\
+# Mismo vocabulario de categorías que usa la capa heurística (HIGH_RISK_KEYWORDS
+# / MEDIUM_RISK_KEYWORDS) — se le pide al LLM que reutilice estos nombres
+# cuando aplique, para que las flags de ambas capas sean comparables. Sin
+# esto, el LLM inventa variantes libres (ej. "hemorragia activa" en vez de
+# "hemorragia") y la deduplicación por episodio (risk_episodes.py, que
+# compara flags por igualdad de string) nunca reconoce que es la misma señal.
+_KNOWN_FLAG_CATEGORIES = sorted(set(HIGH_RISK_KEYWORDS) | set(MEDIUM_RISK_KEYWORDS))
+
+# Plantilla con placeholder __FLAG_CATEGORIES__ en vez de f-string: el JSON
+# de ejemplo más abajo usa llaves literales ({...}), que un f-string
+# interpretaría como campos de formato y rompería el parseo.
+_SYSTEM_PROMPT_TEMPLATE = """\
 Eres un evaluador de riesgo clínico para un chatbot de salud materna.
 Tu tarea es evaluar el nivel de riesgo del mensaje de una gestante o puérpera.
 
@@ -197,10 +208,22 @@ Señales que SIEMPRE son HIGH:
 hemorragia activa, convulsiones, ausencia de movimiento fetal, visión borrosa + cefalea + edema,
 dolor abdominal agudo, fiebre alta con signos de infección, ideas de autolesión.
 
-Si el mensaje incluye síntomas mencionados en turnos previos de la misma conversación,
-evalúa el CONJUNTO de síntomas como un cuadro clínico único, no cada uno por separado.
-Varios síntomas leves combinados pueden justificar un nivel de riesgo mayor al de
-cualquiera de ellos visto de forma aislada.
+Categorías de "flags" conocidas — si el síntoma corresponde a alguna, usa
+EXACTAMENTE ese nombre (no inventes una variante propia); si no corresponde
+a ninguna, usa un nombre corto y descriptivo:
+__FLAG_CATEGORIES__
+
+Si el mensaje incluye síntomas mencionados en turnos previos de la misma conversación
+Y siguen vigentes (la paciente los está describiendo como parte del mismo cuadro,
+por ejemplo completando información tras una pregunta de aclaración), evalúa el
+CONJUNTO de síntomas como un cuadro clínico único. Varios síntomas leves combinados
+pueden justificar un nivel de riesgo mayor al de cualquiera de ellos visto de forma
+aislada.
+
+Si en cambio el mensaje actual NO tiene relación clínica con lo mencionado antes
+(agradecimientos, cambio de tema, una pregunta nueva sin conexión, confirmación de
+que un síntoma ya se resolvió), evalúa el mensaje actual de forma AISLADA — no le
+heredes el nivel de riesgo de síntomas de turnos anteriores que ya no está describiendo.
 
 Responde ÚNICAMENTE con un JSON válido:
 {
@@ -213,9 +236,16 @@ Responde ÚNICAMENTE con un JSON válido:
 No agregues texto antes ni después del JSON.\
 """
 
-# Cuántos turnos previos de la usuaria se incluyen al evaluar riesgo.
-# Acota el crecimiento del prompt en conversaciones largas.
-RISK_HISTORY_USER_TURNS = 5
+SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace(
+    "__FLAG_CATEGORIES__", ", ".join(_KNOWN_FLAG_CATEGORIES)
+)
+
+# Cuántos turnos previos de la usuaria se incluyen al evaluar riesgo — solo
+# en la capa LLM (ver _llm_risk). Ventana corta a propósito: alcanza para
+# una clarificación típica de 1-2 idas y vueltas, sin arrastrar síntomas de
+# muchos turnos atrás que ya no son parte del cuadro actual (ver detect_risk,
+# donde la capa heurística ya NO combina con el historial por la misma razón).
+RISK_HISTORY_USER_TURNS = 2
 
 
 def _extract_recent_user_text(history: Optional[list[dict]], limit: int = RISK_HISTORY_USER_TURNS) -> str:
@@ -249,11 +279,22 @@ def _llm_risk(message: str, history: Optional[list[dict]] = None) -> RiskResult:
     user_content = message.strip()
     prior_user_text = _extract_recent_user_text(history)
     if prior_user_text:
+        # OJO: esta instrucción no puede decir "combina siempre" sin matizarlo
+        # — eso contradice directamente la regla de SYSTEM_PROMPT de evaluar
+        # el mensaje actual aislado cuando no sigue relacionado, y en la
+        # práctica el modelo termina heredando el riesgo del texto previo
+        # (ej. un "gracias, ya estoy mejor" después de "sangrando mucho" se
+        # seguía clasificando high). El criterio de combinar o no depende del
+        # mensaje actual, así que se lo dejamos al modelo explícitamente acá
+        # también, no solo en el system prompt.
         user_content = (
             f"Mensajes previos de la paciente en esta conversación: {prior_user_text}\n\n"
             f"Mensaje actual: {message.strip()}\n\n"
-            "Evalúa el riesgo considerando el conjunto de síntomas mencionados en toda "
-            "la conversación, no solo el mensaje actual."
+            "Si el mensaje actual sigue describiendo o ampliando esos mismos síntomas, "
+            "evalúa el conjunto como un solo cuadro clínico. Si el mensaje actual no está "
+            "relacionado (agradecimiento, cambio de tema, síntoma ya resuelto, confirmación "
+            "de que fue atendida), evalúa SOLO el mensaje actual — el nivel de riesgo debe "
+            "reflejar lo que la paciente está describiendo ahora, no lo que describió antes."
         )
     try:
         response = client.chat.completions.create(
@@ -325,13 +366,15 @@ def detect_risk(
     """
     Detecta el nivel de riesgo clínico del mensaje.
 
-    Primero aplica la capa heurística (instantánea). Si no detecta nada,
-    escala al LLM para evaluación contextual.
+    Primero aplica la capa heurística (instantánea, solo sobre el mensaje
+    actual — no usa `history`, para no "heredar" keywords de turnos viejos
+    ya no relacionados). Si no detecta nada, escala al LLM.
 
-    Cuando se provee `history`, los síntomas mencionados en turnos anteriores
-    de la misma conversación (p. ej. durante un intercambio de clarificación)
-    se combinan con el mensaje actual, para no evaluar cada síntoma aislado
-    del resto del cuadro clínico.
+    Cuando se provee `history`, la capa LLM considera los últimos
+    RISK_HISTORY_USER_TURNS turnos previos de la usuaria: si el mensaje
+    actual sigue describiendo el mismo cuadro (p. ej. completando síntomas
+    tras una pregunta de aclaración), los combina; si cambió de tema, evalúa
+    el mensaje actual aislado (ver SYSTEM_PROMPT).
 
     Args:
         message: Texto del usuario.
@@ -355,10 +398,15 @@ def detect_risk(
             reasoning="Pregunta fuera del dominio de salud materna.",
         )
 
-    # Capa 1: heurística rápida — combina síntomas de turnos previos + mensaje actual
-    prior_user_text = _extract_recent_user_text(history)
-    combined_message = f"{prior_user_text} {message.strip()}" if prior_user_text else message
-    heuristic_result = _check_heuristic(combined_message)
+    # Capa 1: heurística rápida — SOLO el mensaje actual. Combinarla con
+    # historial (como se hacía antes) "contaminaba" turnos posteriores no
+    # relacionados: una keyword de alarma en un turno viejo seguía matcheando
+    # en cada turno siguiente durante varios mensajes, sin importar de qué
+    # hablara la paciente después. La combinación contextual real (síntomas
+    # que siguen vigentes de una clarificación) queda para la capa LLM de
+    # abajo, que sí puede distinguir "sigue describiendo lo mismo" de "cambió
+    # de tema" — ver el prompt reforzado en SYSTEM_PROMPT.
+    heuristic_result = _check_heuristic(message)
     if heuristic_result is not None:
         return heuristic_result
 

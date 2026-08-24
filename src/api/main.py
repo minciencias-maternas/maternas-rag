@@ -184,6 +184,7 @@ def chat(request: ChatRequest) -> ChatResponse:
             query=request.message,
             history=history,
             k=request.k,
+            session_id=request.session_id,
         )
     except Exception as e:
         logger.error(f"[/chat] Error: {e}", exc_info=True)
@@ -235,6 +236,7 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
                 query=request.message,
                 history=history,
                 k=request.k,
+                session_id=request.session_id,
             ):
                 if event.get("type") == "meta":
                     event = {**event, "sources": [

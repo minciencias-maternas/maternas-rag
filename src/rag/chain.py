@@ -38,11 +38,17 @@ from groq import Groq
 
 from src.classifiers.intent_classifier import classify_intent, IntentResult
 from src.classifiers.risk_detector import detect_risk, RiskResult
+from src.rag import risk_episodes
 from src.rag.citations import build_reference_block, format_context, normalize_citation_brackets
 from src.rag.retriever import retrieve
 from src.settings import settings, groq_reasoning_kwargs
 from src.skills import ToolRegistry
 import src.skills.notifier  # noqa: F401 — registra tools del notifier
+
+# Cuántos mensajes previos (usuario + asistente, sin contar el turno actual)
+# se incluyen en el email de alerta — topado para que una conversación muy
+# larga no produzca un correo sin límite.
+NOTIFICATION_HISTORY_CAP = 20
 
 logger = logging.getLogger(__name__)
 
@@ -353,20 +359,59 @@ def _classify_turn(query: str, history: list[dict]) -> TurnClassification:
 # Notificación por riesgo clínico
 # ---------------------------------------------------------------------------
 
-def _run_notification(query: str, intent: str, risk_result: RiskResult) -> bool:
+def _build_notification_conversation(query: str, history: list[dict]) -> list[dict]:
+    """Secuencia de mensajes a incluir en el email de alerta: los últimos
+    NOTIFICATION_HISTORY_CAP turnos del historial + el mensaje actual al
+    final (marcado aparte por notify_risk como el que disparó la alerta)."""
+    capped = history[-NOTIFICATION_HISTORY_CAP:] if history else []
+    conversation = [{"role": m.get("role", ""), "content": m.get("content", "")} for m in capped]
+    conversation.append({"role": "user", "content": query})
+    return conversation
+
+
+def _run_notification(
+    query: str,
+    intent: str,
+    risk_result: RiskResult,
+    history: list[dict] | None = None,
+    session_id: str | None = None,
+) -> bool:
     """Decide si notificar a un clínico y, si corresponde, dispara el email.
 
-    high → notifica siempre. medium → una llamada barata al LLM decide.
+    Deduplica por sesión vía risk_episodes: un turno "low" cierra el
+    episodio; un turno medium/high que repite exactamente la última señal
+    EFECTIVAMENTE notificada (mismo nivel, mismas o menos flags) se omite —
+    solo se notifica de nuevo si el riesgo escala o aparece una flag
+    distinta. Sin esto, un turno contaminado por keywords de varios
+    mensajes atrás (o simplemente el mismo riesgo ya reportado) reenviaría
+    el correo en cada turno siguiente.
+
+    commit() se llama SOLO al confirmar el envío real — no en is_new_signal(),
+    para que un "medium" que el LLM de abajo termina descartando no quede
+    registrado como si sí se hubiera notificado.
+
+    high → notifica siempre (sujeto a la deduplicación de arriba).
+    medium → una llamada barata al LLM decide, también sujeta a ella.
     Devuelve si se notificó, para popular ChatResponse.notified.
     """
+    if risk_result.level == "low":
+        risk_episodes.register_low(session_id)
+        return False
+
+    if risk_result.level != "high" and risk_result.level != "medium":
+        return False
+
+    if not risk_episodes.is_new_signal(session_id, risk_result.level, risk_result.flags):
+        return False
+
+    conversation = _build_notification_conversation(query, history or [])
+
     if risk_result.level == "high":
         ToolRegistry.execute("notify_risk", query=query, risk_level=risk_result.level,
                              intent=intent, reasoning=risk_result.reasoning,
-                             flags=risk_result.flags)
+                             flags=risk_result.flags, conversation=conversation)
+        risk_episodes.commit(session_id, risk_result.level, risk_result.flags)
         return True
-
-    if risk_result.level != "medium":
-        return False
 
     notify_prompt = (
         "Eres un clasificador medico. Decide si este mensaje de una paciente "
@@ -398,7 +443,8 @@ def _run_notification(query: str, intent: str, risk_result: RiskResult) -> bool:
         if "YES" in decision:
             ToolRegistry.execute("notify_risk", query=query, risk_level=risk_result.level,
                                  intent=intent, reasoning=risk_result.reasoning,
-                                 flags=risk_result.flags)
+                                 flags=risk_result.flags, conversation=conversation)
+            risk_episodes.commit(session_id, risk_result.level, risk_result.flags)
             return True
     except Exception as e:
         logger.warning(f"[Chain] Error en decision de notificacion medium: {e}")
@@ -439,15 +485,19 @@ def chat(
     query: str,
     history: list[dict] | None = None,
     k: int | None = None,
+    session_id: str | None = None,
 ) -> ChatResponse:
     """
     Procesa un turno completo del chatbot.
 
     Args:
-        query:   Mensaje del usuario.
-        history: Historial de la conversación (lista de dicts role/content).
-                 Se modifica externamente por el caller.
-        k:       Número de fragmentos a recuperar (default: settings.rag_top_k).
+        query:      Mensaje del usuario.
+        history:    Historial de la conversación (lista de dicts role/content).
+                    Se modifica externamente por el caller.
+        k:          Número de fragmentos a recuperar (default: settings.rag_top_k).
+        session_id: Id de sesión (opcional) para deduplicar notificaciones de
+                    riesgo por episodio — ver src/rag/risk_episodes.py. Sin él,
+                    cada turno medium/high notifica de forma independiente.
 
     Returns:
         ChatResponse con respuesta, intent, risk_level, sources, etc.
@@ -478,7 +528,7 @@ def chat(
             clarification_question=turn.clarification_question,
         )
 
-    notified = _run_notification(query, intent_result.intent, risk_result)
+    notified = _run_notification(query, intent_result.intent, risk_result, history, session_id)
 
     docs, messages = _retrieve_and_build(query, history, risk_result, k)
 
@@ -530,6 +580,7 @@ def chat_stream(
     query: str,
     history: list[dict] | None = None,
     k: int | None = None,
+    session_id: str | None = None,
 ) -> Iterator[dict]:
     """
     Igual que chat(), pero emite el turno como una secuencia de eventos
@@ -575,7 +626,9 @@ def chat_stream(
     notify_result: dict[str, bool] = {}
 
     def _notify_worker() -> None:
-        notify_result["notified"] = _run_notification(query, intent_result.intent, risk_result)
+        notify_result["notified"] = _run_notification(
+            query, intent_result.intent, risk_result, history, session_id
+        )
 
     notify_thread = threading.Thread(target=_notify_worker, daemon=True)
     notify_thread.start()

@@ -27,7 +27,7 @@ def _events(response) -> list[dict]:
     return [json.loads(line) for line in response.iter_lines() if line.strip()]
 
 
-def _happy_path_stream(query, history, k=None):
+def _happy_path_stream(query, history, k=None, session_id=None):
     yield {"type": "status", "stage": "classifying"}
     yield {"type": "status", "stage": "retrieving"}
     yield {
@@ -83,7 +83,7 @@ def test_stream_meta_sources_are_enriched_with_document_name(client, monkeypatch
 
 
 def test_stream_llm_failure_emits_error_event(client, monkeypatch):
-    def _failing_stream(query, history, k=None):
+    def _failing_stream(query, history, k=None, session_id=None):
         yield {"type": "status", "stage": "classifying"}
         yield {"type": "status", "stage": "retrieving"}
         yield {"type": "meta", "intent": "x", "risk_level": "low", "action": "a",
@@ -101,7 +101,7 @@ def test_stream_llm_failure_emits_error_event(client, monkeypatch):
 
 
 def test_stream_clarification_short_circuits_to_done(client, monkeypatch):
-    def _clarify_stream(query, history, k=None):
+    def _clarify_stream(query, history, k=None, session_id=None):
         yield {"type": "status", "stage": "classifying"}
         yield {"type": "meta", "intent": "medicamentos", "risk_level": "low",
                "action": "educational_answer", "risk_flags": [], "sources": [],
@@ -123,7 +123,7 @@ def test_chat_post_still_works_unchanged(client, monkeypatch):
     arreglado junto con el streaming)."""
     from src.rag.chain import ChatResponse
 
-    def _fake_chat(query, history, k=None):
+    def _fake_chat(query, history, k=None, session_id=None):
         return ChatResponse(
             answer="Es normal.",
             intent="sintomas_embarazo",

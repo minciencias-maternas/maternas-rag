@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -257,3 +257,71 @@ class TestDetectRisk:
         result = detect_risk("tengo un dolor de cabeza")
         assert result.level == "medium"
         assert "Error en evaluación" in result.reasoning
+
+
+class TestHeuristicDoesNotInheritStaleHistory:
+    """Regresión: la capa heurística combinaba prior_user_text + mensaje
+    actual, así que una keyword de alarma en un turno viejo seguía
+    matcheando en cada turno siguiente sin relación con ella. Ahora la
+    heurística evalúa SOLO el mensaje actual (ver detect_risk)."""
+
+    def test_unrelated_followup_does_not_inherit_high_keyword(self, mock_groq_client):
+        mock_groq_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(
+                content='{"level": "low", "flags": [], "action": "educational_answer", '
+                        '"reasoning": "mensaje no relacionado con el sangrado previo"}'
+            ))]
+        )
+        history = [{"role": "user", "content": "estoy sangrando mucho"}]
+        result = detect_risk("gracias por la info, hasta luego", history=history)
+
+        # Si la heurística siguiera combinando historial, "sangrando mucho"
+        # habría matcheado de nuevo y nunca habría llegado a llamar al LLM.
+        mock_groq_client.chat.completions.create.assert_called_once()
+        assert result.level == "low"
+
+    def test_unrelated_followup_after_medium_keyword_also_isolated(self, mock_groq_client):
+        mock_groq_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(
+                content='{"level": "low", "flags": [], "action": "educational_answer", '
+                        '"reasoning": "pregunta nueva sin relacion"}'
+            ))]
+        )
+        history = [{"role": "user", "content": "tengo la presión alta"}]
+        result = detect_risk("¿qué alimentos debo evitar?", history=history)
+
+        mock_groq_client.chat.completions.create.assert_called_once()
+        assert result.level == "low"
+
+    def test_current_message_keyword_still_triggers_heuristic(self, mock_groq_client):
+        """El fix no debe romper la detección normal: una keyword en el
+        mensaje ACTUAL (sin necesidad de historial) sigue disparando la
+        heurística de inmediato, sin llamar al LLM."""
+        history = [{"role": "user", "content": "hola, tengo una duda"}]
+        result = detect_risk("estoy sangrando mucho", history=history)
+
+        mock_groq_client.chat.completions.create.assert_not_called()
+        assert result.level == "high"
+        assert result.used_heuristic is True
+
+
+class TestLlmStillReceivesRecentContext:
+    """La capa LLM sí conserva contexto reciente (a diferencia de la
+    heurística) — para combinar síntomas que siguen vigentes, p. ej. tras
+    una pregunta de aclaración. Ver SYSTEM_PROMPT: el LLM decide si el
+    mensaje actual sigue relacionado o no."""
+
+    def test_llm_prompt_includes_recent_prior_user_text(self, mock_groq_client):
+        mock_groq_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(
+                content='{"level": "medium", "flags": ["dolor_moderado"], '
+                        '"action": "medical_consultation", "reasoning": "cuadro combinado"}'
+            ))]
+        )
+        history = [{"role": "user", "content": "tengo hinchazon en los pies"}]
+        detect_risk("y también me duele mucho la cabeza", history=history)
+
+        call_kwargs = mock_groq_client.chat.completions.create.call_args.kwargs
+        user_message = call_kwargs["messages"][1]["content"]
+        assert "hinchazon" in user_message
+        assert "me duele mucho la cabeza" in user_message
