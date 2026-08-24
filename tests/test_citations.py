@@ -11,6 +11,7 @@ from src.rag.citations import (
     document_locator,
     document_name,
     format_context,
+    normalize_citation_brackets,
 )
 
 
@@ -180,3 +181,33 @@ def test_build_reference_block_never_says_fragmento():
     docs = [{"source_dataset": "medmcqa", "subject": "Anatomy"}]
     block = build_reference_block("Dato [1].", docs)
     assert "fragmento" not in block.lower()
+
+
+# ---------------------------------------------------------------------------
+# normalize_citation_brackets
+# ---------------------------------------------------------------------------
+# gpt-oss-120b cita de forma intermitente con corchetes CJK de ancho completo
+# ("【1】") en vez de ASCII ("[1]"), sin patrón previsible entre turnos —
+# ver qa_technical.md Q34. Sin normalizar, _CITATION_RE nunca matchea esas
+# citas y build_reference_block() las descarta en silencio.
+
+def test_normalize_citation_brackets_converts_fullwidth_to_ascii():
+    assert normalize_citation_brackets("Dato respaldado【1】.") == "Dato respaldado[1]."
+
+
+def test_normalize_citation_brackets_handles_multiple_citations():
+    text = "Esto【1】 y también esto【2】."
+    assert normalize_citation_brackets(text) == "Esto[1] y también esto[2]."
+
+
+def test_normalize_citation_brackets_leaves_ascii_untouched():
+    text = "Ya viene en ASCII [1] y [2]."
+    assert normalize_citation_brackets(text) == text
+
+
+def test_build_reference_block_recognizes_citation_after_normalizing():
+    docs = [{"source_dataset": "medmcqa", "subject": "Anatomy", "topic": "Kidney"}]
+    answer = normalize_citation_brackets("Dato respaldado【1】.")
+    block = build_reference_block(answer, docs)
+    assert "Fuentes:" in block
+    assert "[1] MedMCQA · Anatomy — Kidney" in block

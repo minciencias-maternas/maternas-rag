@@ -1478,4 +1478,138 @@ Con la medición en mano, se removieron los vectores de forma permanente:
 
 ---
 
-*Última actualización: 13 de agosto de 2026*
+## Q33: ¿Por qué se migró el LLM generador de `llama-3.3-70b-versatile` a `openai/gpt-oss-120b`? ¿Qué cambió en el código y qué trade-offs quedaron?
+
+**Contexto:** Groq dio de baja `llama-3.3-70b-versatile` el 16 de agosto de 2026 (anunciado el 17 de junio). Es el LLM de producción del sistema: genera respuestas, clasifica intención (`intent_classifier.py`), evalúa riesgo (`risk_detector.py`), decide notificaciones (`chain.py::_run_notification`) y redacta clarificaciones (`chain.py::_generate_clarification`). El cambio de modelo no fue una comparación libre entre alternativas — fue forzado por la baja del proveedor, con el sistema de producción caído en su ruta principal hasta migrar.
+
+### Por qué `gpt-oss-120b` y no otra cosa
+
+Groq recomendó dos reemplazos oficiales: `openai/gpt-oss-120b` y `qwen/qwen3.6-27b`. Se descartó salir de Groq (velocidad, tier gratuito, cero reescritura del cliente) y, entre las dos alternativas de Groq, se eligió `gpt-oss-120b`:
+
+- Mismo tier gratuito que el modelo anterior.
+- Más rápido (~500 tok/s vs ~275 de `llama-3.3-70b`) y con ventana de contexto mayor (131k vs 128k).
+- `qwen/qwen3.6-27b` quedó como plan B explícito: soporta `reasoning_effort:"none"`, lo que lo volvería un *drop-in* sin razonamiento si el español de `gpt-oss-120b` hubiera resultado notoriamente más frío o mecánico en las pruebas en vivo — no fue necesario, el helper de reasoning (ver abajo) ya lo contempla sin cambios de código, solo cambiar `GROQ_MODEL`.
+- El SDK `groq==0.13.1` (de diciembre de 2024, anterior a `gpt-oss`) **no se actualizó**: no tiene los parámetros de razonamiento tipados, pero sí acepta `extra_body`, así que se pasan por ahí. Actualizar el SDK habría puesto en riesgo el workaround ya existente de `x_groq.usage` en streaming (`chain.py`, manejo de tokens en `chat_stream()`).
+
+### Por qué no alcanzaba con cambiar `GROQ_MODEL` en `.env`
+
+`gpt-oss-120b` es un **modelo de razonamiento**, y el código asumía uno que no lo es. Tres consecuencias concretas, encontradas y corregidas antes de tocar producción:
+
+1. **Fuga de `<think>` a la respuesta.** Groq solo cambia `reasoning_format` a `parsed` automáticamente cuando hay JSON mode o tool use. Los dos clasificadores (`response_format={"type":"json_object"}`) se salvan; las 4 llamadas de texto libre en `chain.py` no — sin corregirlo, el bloque `<think>...</think>` habría aparecido literalmente en el chat de la gestante, incluyendo en streaming token a token.
+2. **Los tokens de razonamiento cuentan contra `max_tokens`.** El caso más grave: `_run_notification()` usaba `max_tokens=10` para decidir `"YES"/"NO"` antes de notificar un riesgo medio a un clínico. El razonamiento se habría comido el presupuesto entero, dejando `content` vacío y `"YES" not in ""` — **un riesgo medio habría dejado de notificar, en silencio, sin ningún error visible.**
+3. **Cascada de fallback silencioso.** Si `classify_intent()` recibe `content` vacío, cae a `pregunta_fuera_de_alcance`; `detect_risk()` tiene un atajo que ante ese intent devuelve `low` sin siquiera consultar al LLM (`risk_detector.py`) — un fallo de parseo del clasificador se habría convertido en un riesgo bajo silencioso.
+
+### Solución implementada
+
+Helper centralizado en `src/settings.py`:
+
+```python
+_REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3")
+
+def groq_reasoning_kwargs(json_mode: bool = False) -> dict:
+    model = settings.groq_model.lower()
+    if not any(marker in model for marker in _REASONING_MODEL_MARKERS):
+        return {}
+    kwargs = {"reasoning_effort": settings.groq_reasoning_effort}
+    if not json_mode:
+        kwargs["reasoning_format"] = "hidden"
+    return kwargs
+```
+
+Gateado por nombre de modelo (no por un flag manual): si `GROQ_MODEL` vuelve a ser un modelo clásico (llama, etc.) en el futuro, esto se desactiva solo, sin tocar los 6 call sites. `json_mode=True` no manda `reasoning_format` porque Groq ya fuerza `parsed` en JSON mode y pedir `raw` explícitamente ahí da `400`.
+
+Aplicado como `extra_body=groq_reasoning_kwargs(...)` en los 6 call sites (`chain.py` ×4, `intent_classifier.py`, `risk_detector.py`). Además:
+
+- **Topes de `max_tokens` subidos** para que el razonamiento no vacíe la respuesta útil: notificación 10→512, clarificación 100→700, clasificación de intención 150→800, detección de riesgo 200→900, generación de respuesta 800→1800.
+- **Parseo blindado** independiente del modelo: `(resp.choices[0].message.content or "")` en vez de asumir no-`None`, con `logger.warning(...)` si el resultado queda vacío — antes, un `content=None` lanzaba `AttributeError` en `.strip()`, capturado genéricamente por el `except` más cercano; ahora cae en el camino de fallback correcto (deterministico en clarificación, `_fallback_answer()` en generación) y deja rastro en logs en vez de fallar en silencio.
+- `GROQ_REASONING_EFFORT=low` en `.env` — el default de Groq es `medium`, de más para clasificar intención/riesgo o redactar una clarificación de una oración.
+- `eval_pipeline.py`: el modelo de *fallback* del juez de Ragas (`GROQ_FALLBACK`, usado solo si falta `CEREBRAS_KEY`) se actualizó de `llama-3.1-8b-instant` (también dado de baja el mismo día) a `openai/gpt-oss-20b`.
+
+### Validación antes de producción
+
+En orden, sin saltarse ninguno: `pytest` completo (241/241, todo mockeado, sin cambios de comportamiento); smoke test directo contra los 6 call paths reales de Groq confirmando cero fugas de `<think>` y JSON parseable; confirmación en vivo del modelo activo (`GET /admin/config` → `"groq_model":"openai/gpt-oss-120b"`, verificado también en el panel Configuración); y finalmente pruebas en vivo con Chrome — Streamlit (4 sesiones nuevas: pregunta informativa, clarificación completa, riesgo medio, riesgo alto) y Telegram (`/reset` para simular sesión nueva) — confirmando tono cálido en español intacto, el flujo de clarificación funcionando, y **los tres correos SMTP de riesgo llegando con el contenido correcto** (medio, medio-tras-clarificación, alto — este último es la ruta más peligrosa de las tres consecuencias descritas arriba).
+
+### Trade-offs medidos (Ragas, Config D, mismo protocolo, seed=42, judge Cerebras `gemma-4-31b`)
+
+| Métrica | `llama-3.3-70b` (15-ago, N=14) | `gpt-oss-120b` (19-ago, N=15) | Δ |
+|---|---:|---:|---:|
+| `faithfulness` | 0.4973 | 0.3915 | **−21%** |
+| `answer_correctness` | 0.5507 | 0.6362 | **+15%** |
+| `answer_relevancy` | 0.7328 | 0.8101 | **+11%** (cruza a 🟢, ≥0.80) |
+| `context_recall` | 0.4524 | 0.4222 | −7% (ruido — retrieval sin cambios) |
+| `context_precision` | 0.3599 | 0.3359 | −7% (ruido — retrieval sin cambios) |
+| `latency_avg_s` | 9.58 | 12.49 | **+30%** |
+| `latency_p95_s` | 15.93 | 21.81 | **+37%** |
+
+`answer_relevancy` y `answer_correctness` mejoran de forma consistente con que `gpt-oss-120b` es un modelo de razonamiento: pensar antes de responder ayuda a mantenerse enfocado en lo que se preguntó y a acercarse más al *ground truth*. `faithfulness` baja de forma más marcada de lo que explicaría solo el ruido estadístico (~0.25 std con N=14-15, por `eval_runbook.md`) — hipótesis de trabajo, no confirmada: el juez de Ragas premia afirmaciones verificables palabra por palabra contra el contexto recuperado, y un modelo que sintetiza/reformula más (en vez de citar literalmente) puntúa peor en esta métrica específica aunque la respuesta sea igual o más correcta en sustancia — coherente con que `answer_correctness` sube al mismo tiempo. No se investigó a fondo la causa exacta; queda en el backlog (revisión cualitativa de pares con `faithfulness` bajo). La latencia sube por el overhead de razonamiento incluso con `reasoning_effort:"low"`.
+
+### Limitaciones conocidas de este cambio
+
+- **Cuota de Groq más ajustada por turno.** Con `reasoning_effort:"low"` los tokens de razonamiento siguen sumando al consumo por llamada; en tier gratuito (8.000 TPM observados durante las pruebas) el límite por minuto se agota más rápido que con el modelo anterior si se encadenan varias llamadas seguidas (por ejemplo, la suite de pruebas en vivo de esta migración necesitó espaciar las llamadas ~12s para no chocar con el límite).
+- **`faithfulness` no explicado del todo.** La caída es consistente en dirección con la hipótesis de "razona/sintetiza en vez de citar", pero no se confirmó con una revisión cualitativa par por par — con N=15 no se puede descartar del todo que sea varianza.
+- **SDK de Groq sin actualizar.** `groq==0.13.1` no tiene los parámetros de razonamiento tipados; se pasan vía `extra_body`, lo que funciona pero no está validado por el tipado del cliente — un cambio de la API de Groq en este punto no daría error en tiempo de desarrollo, solo en runtime.
+- **`reasoning_format:"hidden"` es todo o nada.** No hay forma de inspeccionar el razonamiento del modelo para debugging (por ejemplo, por qué clasificó cierto mensaje como determinado nivel de riesgo) sin cambiar temporalmente a `reasoning_format:"parsed"` y leer el campo `message.reasoning` aparte — no implementado, no hay ruta de logging del razonamiento hoy.
+- **El juez de Ragas sigue siendo Cerebras `gemma-4-31b`, no `gpt-oss-120b`.** Correcto por diseño (el juez debe ser independiente del generador), pero significa que el `GROQ_FALLBACK` del juez (`openai/gpt-oss-20b`, usado solo si falta `CEREBRAS_KEY`) nunca se probó en esta migración — sigue siendo una ruta no ejercida en la práctica, igual que lo era `llama-3.1-8b-instant` antes.
+
+**Archivos modificados:**
+- `src/settings.py` — nuevo `groq_reasoning_kwargs()`, campo `groq_reasoning_effort`
+- `src/rag/chain.py` — `extra_body` en los 4 call sites del LLM, `max_tokens` subidos, parseo blindado en `_run_notification()` y en la respuesta de `chat()`
+- `src/classifiers/intent_classifier.py`, `src/classifiers/risk_detector.py` — `extra_body` en modo JSON, `max_tokens` subidos, parseo blindado
+- `src/evaluation/eval_pipeline.py` — `GROQ_FALLBACK` actualizado a `openai/gpt-oss-20b`
+- `.env`, `.env.example` — `GROQ_MODEL=openai/gpt-oss-120b`, nuevo `GROQ_REASONING_EFFORT=low`
+- `README.md` — tabla de stack y tabla de evaluación actualizadas
+- `docs/DOCUMENTACION_oss120b.md`, `INFORME TECNICO MATERNAS/outputs/informe-tecnico-maternas-20260819_oss120b.md` (+ PDFs) — nuevas versiones de la documentación y el informe técnico con el modelo migrado; se conservan los originales (`DOCUMENTACION.md`, `informe-tecnico-maternas-20260815.md`) para trazabilidad
+- `evaluation_reports/eval_raw_configD_oss120b_20260819_113326.json`, `eval_report_configD_oss120b_20260819_113326.md`, `eval_results_configD_oss120b_20260819_113326.json` — nueva corrida de evaluación
+
+---
+
+## Q34: ¿Por qué `gpt-oss-120b` a veces no genera el bloque `Fuentes:` en Streamlit, aunque el retrieval sí trajo buenos resultados?
+
+**Contexto:** Revisando las capturas en vivo tomadas para la migración de Q33, se detectó que varias respuestas de `gpt-oss-120b` no traían el bloque `---\nFuentes:\n[n] ...` al final, pese a que el panel lateral mostraba 5 fragmentos recuperados con scores altos (0.83–0.86) — comportamiento distinto al de `llama-3.3-70b`, donde el bloque aparecía de forma consistente (ver capturas del informe del 15/08).
+
+### Causa raíz
+
+`gpt-oss-120b` cita de forma **intermitente** con corchetes CJK de ancho completo — `【1】` (U+3010 LEFT BLACK LENTICULAR BRACKET / U+3011 RIGHT BLACK LENTICULAR BRACKET) — en vez de corchetes ASCII estándar `[1]` (U+005B/U+005D), sin ningún patrón previsible: la misma pregunta repetida puede citar con uno u otro estilo. Confirmado reproduciendo la consulta exacta de una de las capturas ("Tengo hinchazón leve en los pies, estoy en la semana 30, ¿es normal?") directamente contra `chat()`:
+
+```
+>>> resp.answer
+'Sí, la hinchazón leve de pies y tobillos es frecuente a partir del tercer
+trimestre y, en la mayoría de los casos, no indica un problema grave【1】. ...'
+```
+
+`build_reference_block()` (`src/rag/citations.py`) usa `_CITATION_RE = re.compile(r"\[(\d+)\]")` — coincide solo con corchetes ASCII. Cuando el modelo cita con `【1】`, el regex no matchea nada, `cited` queda vacío, y la función devuelve `""`: el bloque `Fuentes:` se descarta en silencio. El marcador inline `【1】` sí queda en el texto (por eso a veces se veía un número suelto sin corchetes normales en el chat), pero sin el bloque de referencias al final.
+
+No es un problema del retrieval ni de la calidad de las fuentes — es puramente un problema de formato de salida del LLM nuevo, invisible en los logs (`build_reference_block()` no loguea nada al devolver `""`, porque "sin citas válidas" es un camino normal cuando el LLM decide no citar).
+
+### Solución aplicada
+
+`src/rag/citations.py` — nueva función `normalize_citation_brackets()`:
+
+```python
+_FULLWIDTH_BRACKETS_RE = re.compile(r"【(\d+)】")
+
+def normalize_citation_brackets(text: str) -> str:
+    return _FULLWIDTH_BRACKETS_RE.sub(r"[\1]", text)
+```
+
+Se aplica al `answer` completo (tras `.strip()`, antes de `build_reference_block()`) en los dos puntos de `src/rag/chain.py` donde se arma la respuesta final: `chat()` (no streaming) y `chat_stream()` (streaming, aplicado al texto ya acumulado de todos los `delta`, no por token — normalizar carácter a carácter mientras se transmite sería frágil y no aporta nada, ya que el bloque de referencias solo se construye una vez, al final). Esto corrige ambos síntomas a la vez: el marcador inline se ve como `[1]` estándar y el bloque `Fuentes:` se arma sin importar qué estilo de corchete haya elegido el modelo en ese turno.
+
+### Validación
+
+Suite `pytest` completa en verde (241/241) tras el cambio. Se repitieron en vivo las tres consultas que antes mostraban el problema (`chat()` directo, sin pasar por la API):
+
+| Consulta | Antes del fix | Después del fix |
+|---|---|---|
+| "Tengo hinchazón leve..." | `grave【1】.` sin bloque `Fuentes:` | `grave[1].` + `Fuentes: [1] GAP_Control prenatal del embarazo normal_6105 · págs. 15-16` |
+| "¿Qué alimentos debo evitar...?" | `(pez espada...)【2】` sin bloque | `[2]`...`[1]`...`[3]` + bloque con 3 fuentes agrupadas |
+| "¿Puedo tomar ibuprofeno...?" | `[3]` ASCII, ya funcionaba | Sin cambios — confirma que el fix no rompe el caso que ya andaba bien |
+
+Se reinició la API (proceso `uvicorn`, sin `--reload`, con el código viejo en memoria) y se repitió la consulta de hinchazón en vivo por Streamlit, en una sesión nueva: el bloque `Fuentes:` aparece correctamente. Capturas antes/después en el informe técnico, sección 9.6.
+
+**Archivos modificados:**
+- `src/rag/citations.py` — nueva `normalize_citation_brackets()` y `_FULLWIDTH_BRACKETS_RE`
+- `src/rag/chain.py` — se llama a `normalize_citation_brackets()` antes de `build_reference_block()` en `chat()` y `chat_stream()`
+
+---
+
+*Última actualización: 19 de agosto de 2026*

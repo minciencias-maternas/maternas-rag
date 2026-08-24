@@ -14,7 +14,11 @@ class Settings(BaseSettings):
     # --- Groq ---
     groq_api_key: str = Field(..., env="GROQ_API_KEY")
     groq_api_key_2: str = Field("", env="GROQ_API_KEY_2")   # key dedicada para Ragas judge
-    groq_model: str = Field("llama-3.1-70b-versatile", env="GROQ_MODEL")
+    groq_model: str = Field("openai/gpt-oss-120b", env="GROQ_MODEL")
+    # Solo aplica a modelos "de razonamiento" (gpt-oss, qwen3) — ver
+    # groq_reasoning_kwargs() más abajo. "low" alcanza para clasificar
+    # intención/riesgo y redactar; el default de Groq (medium) es de más.
+    groq_reasoning_effort: str = Field("low", env="GROQ_REASONING_EFFORT")
 
     # --- Embedding ---
     embedding_model: str = Field("intfloat/multilingual-e5-base", env="EMBEDDING_MODEL")
@@ -86,3 +90,32 @@ class Settings(BaseSettings):
 
 # Instancia global — importar desde aquí en todos los módulos
 settings = Settings()
+
+
+# Modelos de razonamiento servidos por Groq (gpt-oss, qwen3.x) exponen
+# <think>...</think> dentro de message.content salvo que se pida lo
+# contrario, y sus tokens de razonamiento cuentan contra max_tokens. Los
+# modelos "clásicos" (llama, etc.) no soportan estos parámetros — mandarlos
+# ahí puede dar 400. Se gatea por nombre para que cambiar GROQ_MODEL a un
+# modelo clásico desactive esto solo, sin tocar código en los call sites.
+_REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3")
+
+
+def groq_reasoning_kwargs(json_mode: bool = False) -> dict:
+    """extra_body a pasar a client.chat.completions.create() para que el
+    razonamiento de modelos gpt-oss/qwen3 en Groq no se filtre a la
+    respuesta ni se coma el presupuesto de tokens útiles.
+
+    json_mode=True: no se manda reasoning_format — Groq ya fuerza "parsed"
+    cuando hay response_format=json_object, y pedir "raw" explícitamente ahí
+    da 400. json_mode=False (texto libre): se pide "hidden" para que
+    message.content no incluya el bloque <think>.
+    """
+    model = settings.groq_model.lower()
+    if not any(marker in model for marker in _REASONING_MODEL_MARKERS):
+        return {}
+
+    kwargs: dict = {"reasoning_effort": settings.groq_reasoning_effort}
+    if not json_mode:
+        kwargs["reasoning_format"] = "hidden"
+    return kwargs

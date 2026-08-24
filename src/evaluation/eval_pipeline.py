@@ -285,7 +285,7 @@ def phase_evaluate(raw_path: Path) -> dict:
 
     CEREBRAS_MODEL    = "gemma-4-31b"
     CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
-    GROQ_FALLBACK     = "llama-3.1-8b-instant"
+    GROQ_FALLBACK     = "openai/gpt-oss-20b"  # llama-3.1-8b-instant fue dado de baja por Groq
 
     sep = "=" * 62
     print(sep)

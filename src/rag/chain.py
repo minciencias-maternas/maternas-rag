@@ -38,9 +38,9 @@ from groq import Groq
 
 from src.classifiers.intent_classifier import classify_intent, IntentResult
 from src.classifiers.risk_detector import detect_risk, RiskResult
-from src.rag.citations import build_reference_block, format_context
+from src.rag.citations import build_reference_block, format_context, normalize_citation_brackets
 from src.rag.retriever import retrieve
-from src.settings import settings
+from src.settings import settings, groq_reasoning_kwargs
 from src.skills import ToolRegistry
 import src.skills.notifier  # noqa: F401 — registra tools del notifier
 
@@ -236,9 +236,14 @@ def _generate_clarification(
             model=settings.groq_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.4,
-            max_tokens=100,
+            max_tokens=700,
+            extra_body=groq_reasoning_kwargs(),
         )
-        return resp.choices[0].message.content.strip()
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            logger.warning("[Chain] Clarificacion vacia del LLM (razonamiento sin respuesta final?) — usando fallback")
+            return f"Con gusto te ayudo. Para darte la mejor respuesta, ¿podrías contarme {missing_str}?"
+        return text
     except Exception as e:
         logger.warning(f"[Chain] Error generando clarificacion: {e}")
         # Fallback determinista si el LLM falla
@@ -381,9 +386,15 @@ def _run_notification(query: str, intent: str, risk_result: RiskResult) -> bool:
             model=settings.groq_model,
             messages=[{"role": "user", "content": notify_prompt}],
             temperature=0,
-            max_tokens=10,
+            max_tokens=512,
+            extra_body=groq_reasoning_kwargs(),
         )
-        decision = resp.choices[0].message.content.strip().upper()
+        decision = (resp.choices[0].message.content or "").strip().upper()
+        if not decision:
+            # No debe pasar inadvertido: un vacio aca hoy significa "no
+            # notificar" sin dejar rastro, y es la ruta que decide si un
+            # riesgo medio llega o no a un clinico.
+            logger.warning("[Chain] Decision de notificacion vacia del LLM — tratando como NO")
         if "YES" in decision:
             ToolRegistry.execute("notify_risk", query=query, risk_level=risk_result.level,
                                  intent=intent, reasoning=risk_result.reasoning,
@@ -479,14 +490,20 @@ def chat(
             model=settings.groq_model,
             messages=messages,
             temperature=0.3,
-            max_tokens=800,
+            max_tokens=1800,
+            extra_body=groq_reasoning_kwargs(),
         )
-        answer      = response.choices[0].message.content.strip()
+        answer      = (response.choices[0].message.content or "").strip()
         tokens_used = response.usage.total_tokens if response.usage else 0
 
-        ref_block = build_reference_block(answer, docs)
-        if ref_block:
-            answer += "\n\n" + ref_block
+        if not answer:
+            logger.error("[Chain] Respuesta vacia del LLM (max_tokens agotado en razonamiento?)")
+            answer = _fallback_answer(risk_result)
+        else:
+            answer = normalize_citation_brackets(answer)
+            ref_block = build_reference_block(answer, docs)
+            if ref_block:
+                answer += "\n\n" + ref_block
 
     except Exception as e:
         logger.error(f"[Chain] Error generando respuesta: {e}")
@@ -587,8 +604,9 @@ def chat_stream(
             model=settings.groq_model,
             messages=messages,
             temperature=0.3,
-            max_tokens=800,
+            max_tokens=1800,
             stream=True,
+            extra_body=groq_reasoning_kwargs(),
         )
         for chunk in stream:
             # groq==0.13.1 no acepta stream_options={"include_usage": True}
@@ -622,7 +640,7 @@ def chat_stream(
         yield {"type": "error", "detail": str(e)[:200]}
         return
 
-    answer = "".join(answer_parts).strip()
+    answer = normalize_citation_brackets("".join(answer_parts).strip())
     ref_block = build_reference_block(answer, docs)
     if ref_block:
         answer += "\n\n" + ref_block

@@ -40,7 +40,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from groq import Groq
-from src.settings import settings
+from src.settings import settings, groq_reasoning_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -176,10 +176,11 @@ def classify_intent(
             model=settings.groq_model,
             messages=messages,
             temperature=0.0,          # clasificación determinista
-            max_tokens=150,
+            max_tokens=800,
             response_format={"type": "json_object"},
+            extra_body=groq_reasoning_kwargs(json_mode=True),
         )
-        raw = response.choices[0].message.content.strip()
+        raw = (response.choices[0].message.content or "").strip()
         return _parse_response(raw, message)
 
     except Exception as e:

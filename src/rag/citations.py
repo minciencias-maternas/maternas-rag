@@ -136,6 +136,20 @@ def format_context(docs: list[dict[str, Any]], max_chars: int = 4000) -> str:
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 
+# gpt-oss-120b (a diferencia de llama-3.3-70b) cita de forma intermitente con
+# corchetes CJK de ancho completo ("【1】", U+3010/U+3011) en vez de ASCII
+# ("[1]") — mismo prompt, mismo turno, sin patrón previsible. Sin esto,
+# _CITATION_RE nunca matchea esas citas y build_reference_block() las
+# descarta en silencio (ver qa_technical.md Q33).
+_FULLWIDTH_BRACKETS_RE = re.compile(r"【(\d+)】")
+
+
+def normalize_citation_brackets(text: str) -> str:
+    """Convierte citas en corchetes CJK de ancho completo a ASCII estándar,
+    para que _CITATION_RE las reconozca sin importar qué estilo haya
+    emitido el LLM en ese turno."""
+    return _FULLWIDTH_BRACKETS_RE.sub(r"[\1]", text)
+
 
 def build_reference_block(answer: str, docs: list[dict[str, Any]]) -> str:
     """Arma el bloque 'Fuentes:' agrupando citas [n] del mismo documento.

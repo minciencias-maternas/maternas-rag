@@ -12,7 +12,7 @@ Chatbot conversacional basado en arquitectura RAG orientado a madres gestantes. 
 |---|---|
 | Embedding | `intfloat/multilingual-e5-base` (768 dims, ES/EN/ZH) en CUDA |
 | Vector store | FAISS `IndexFlatIP` — 253,455 vectores |
-| LLM | `llama-3.3-70b-versatile` vía Groq API |
+| LLM | `openai/gpt-oss-120b` vía Groq API |
 | API | FastAPI + uvicorn |
 | UI | Streamlit |
 | Bot | Telegram (`python-telegram-bot`) |
@@ -243,7 +243,7 @@ El sistema se evalúa con el framework **Ragas** sobre el benchmark **MaternaQA-
 
 | Fase | Modelo | Rol |
 |---|---|---|
-| 1 — Generación | `llama-3.3-70b-versatile` (Groq) | El chatbot RAG genera respuestas reales |
+| 1 — Generación | `openai/gpt-oss-120b` (Groq) | El chatbot RAG genera respuestas reales |
 | 2 — Evaluación | `gemma-4-31b` (Cerebras) | Juez externo independiente vía Ragas |
 
 ```bash

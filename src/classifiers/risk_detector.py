@@ -39,7 +39,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from groq import Groq
-from src.settings import settings
+from src.settings import settings, groq_reasoning_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -263,10 +263,11 @@ def _llm_risk(message: str, history: Optional[list[dict]] = None) -> RiskResult:
                 {"role": "user",   "content": user_content},
             ],
             temperature=0.0,
-            max_tokens=200,
+            max_tokens=900,
             response_format={"type": "json_object"},
+            extra_body=groq_reasoning_kwargs(json_mode=True),
         )
-        raw = response.choices[0].message.content.strip()
+        raw = (response.choices[0].message.content or "").strip()
         return _parse_llm_response(raw)
 
     except Exception as e:
