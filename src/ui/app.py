@@ -14,6 +14,7 @@ mostrar el aviso.
 """
 
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -64,6 +65,13 @@ if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 if "admin_token" not in st.session_state:
     st.session_state.admin_token = ""
+if "session_id" not in st.session_state:
+    # Aleatorio, nunca derivado de nada identificable — solo alimenta el
+    # conteo de "uso en tiempo real" de Métricas (ver src/api/usage_sessions.py).
+    # Un refresh duro del navegador crea una sesión de Streamlit nueva de
+    # cero, así que también genera un session_id nuevo: limitación conocida,
+    # no hay forma de persistirlo sin cookies/localStorage.
+    st.session_state.session_id = str(uuid.uuid4())
 
 # ---------------------------------------------------------------------------
 # Gate de consentimiento — antes de la sonda de salud y de la navegación,

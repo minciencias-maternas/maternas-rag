@@ -49,7 +49,7 @@ from src.api.schemas import (
     HealthResponse,
     SourceDoc,
 )
-from src.api import bot_supervisor
+from src.api import bot_supervisor, usage_sessions
 from src.api.routes_admin import router as admin_router
 from src.api.routes_bot import router as bot_router
 from src.api.routes_documents import router as documents_router
@@ -191,6 +191,8 @@ def chat(request: ChatRequest) -> ChatResponse:
 
     sources = [_source_doc(s) for s in result.sources]
 
+    usage_sessions.touch(request.session_id, request.platform, result.tokens_used)
+
     return ChatResponse(
         answer=result.answer,
         intent=result.intent,
@@ -238,6 +240,10 @@ def chat_stream(request: ChatRequest) -> StreamingResponse:
                     event = {**event, "sources": [
                         _source_doc(s).model_dump() for s in event.get("sources", [])
                     ]}
+                elif event.get("type") == "done":
+                    usage_sessions.touch(
+                        request.session_id, request.platform, event.get("tokens_used", 0)
+                    )
                 yield json.dumps(event, ensure_ascii=False) + "\n"
         except Exception as e:
             logger.error(f"[/chat/stream] Error: {e}", exc_info=True)

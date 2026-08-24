@@ -9,7 +9,7 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-from src.ui.client import get_evaluation_detail, list_evaluations
+from src.ui.client import get_evaluation_detail, get_usage_sessions, list_evaluations
 
 # Mismo semáforo que usa el reporte markdown del pipeline de evaluación
 # (foragents/eval_runbook.md): 🟢 ≥0.80 · 🟡 0.60–0.80 · 🔴 <0.60
@@ -32,6 +32,61 @@ def _semaforo(value) -> str:
     if v >= 0.60:
         return "🟡"
     return "🔴"
+
+
+def _format_duration(seconds) -> str:
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return "—"
+    m, s = divmod(max(0, s), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _render_usage_platform(label: str, icon: str, sessions: list[dict]) -> None:
+    with st.container(border=True):
+        st.caption(f"{icon} {label}")
+        st.write(f"{len(sessions)} sesión(es) activa(s)")
+        if sessions:
+            rows = [
+                {
+                    "Duración activa": _format_duration(s.get("active_seconds")),
+                    "Tokens usados":   f"{s.get('tokens_total', 0):,}",
+                }
+                for s in sessions
+            ]
+            # Sin columna de identificador ni index estable entre refrescos —
+            # el orden ya viene por duración descendente desde el backend
+            # (usage_sessions.active_by_platform), no hay forma de mapear
+            # una fila a "la misma persona" de un refresh al siguiente.
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _render_usage_section(admin_token: str) -> None:
+    st.subheader("Uso en tiempo real")
+    st.caption(
+        "Sesiones activas (sin actividad hace más de 15 min se consideran cerradas). "
+        "No se muestra ningún identificador de sesión ni de usuario — solo duración y "
+        "tokens, para que no sea posible diferenciar una sesión de otra."
+    )
+    try:
+        usage = get_usage_sessions(admin_token)
+    except httpx.HTTPError:
+        st.warning("No se pudo cargar el uso en tiempo real.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        _render_usage_platform("Streamlit", "💻", usage.get("streamlit", []))
+    with col2:
+        _render_usage_platform("Telegram", "✈️", usage.get("telegram", []))
+
+    st.write("")
 
 
 def _render_breakdown(title: str, data: dict) -> None:
@@ -62,6 +117,10 @@ def render_metrics() -> None:
         return
 
     admin_token = st.session_state.admin_token
+
+    _render_usage_section(admin_token)
+    st.divider()
+
     try:
         runs = list_evaluations(admin_token).get("runs", [])
     except httpx.HTTPError:

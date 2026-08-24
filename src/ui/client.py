@@ -41,20 +41,24 @@ def check_health() -> dict:
     return r.json()
 
 
-def call_chat(message: str, history: list) -> dict:
-    payload = {"message": message, "history": history, "k": 5}
+def call_chat(message: str, history: list, session_id: str = "") -> dict:
+    payload = {"message": message, "history": history, "k": 5, "platform": "streamlit"}
+    if session_id:
+        payload["session_id"] = session_id
     r = httpx.post(f"{API_URL}/chat", json=payload, timeout=API_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
-def stream_chat(message: str, history: list, k: int = 5) -> Iterator[dict]:
+def stream_chat(message: str, history: list, k: int = 5, session_id: str = "") -> Iterator[dict]:
     """Turno del chat como secuencia de eventos NDJSON (ver POST /chat/stream).
 
     Igual que call_chat(), sin captura de excepciones: httpx.HTTPError
     sube tal cual a la vista, que decide cómo mostrarlo.
     """
-    payload = {"message": message, "history": history, "k": k}
+    payload = {"message": message, "history": history, "k": k, "platform": "streamlit"}
+    if session_id:
+        payload["session_id"] = session_id
     timeout = httpx.Timeout(connect=5.0, read=API_TIMEOUT, write=10.0, pool=5.0)
     with httpx.stream("POST", f"{API_URL}/chat/stream", json=payload, timeout=timeout) as r:
         if r.status_code >= 400:
@@ -158,6 +162,12 @@ def update_admin_config(admin_token: str, **fields) -> dict:
         headers=_admin_headers(admin_token),
         timeout=10,
     )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_usage_sessions(admin_token: str) -> dict:
+    r = httpx.get(f"{API_URL}/admin/usage_sessions", headers=_admin_headers(admin_token), timeout=10)
     r.raise_for_status()
     return r.json()
 

@@ -167,7 +167,7 @@ def render_chat() -> None:
     fell_back = False
 
     try:
-        for event in stream_chat(user_text, history_payload):
+        for event in stream_chat(user_text, history_payload, session_id=st.session_state.session_id):
             etype = event.get("type")
 
             if etype == "status":
@@ -239,7 +239,7 @@ def render_chat() -> None:
 
     status.update(label="Reintentando sin streaming…")
     try:
-        result = call_chat(user_text, history_payload)
+        result = call_chat(user_text, history_payload, session_id=st.session_state.session_id)
     except httpx.ConnectError:
         status.update(state="error", expanded=False)
         st.error("No se puede conectar con la API. ¿Está corriendo en el puerto 8080?")

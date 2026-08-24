@@ -22,6 +22,7 @@ from pathlib import Path
 import dotenv
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from src.api import usage_sessions
 from src.api.auth import require_admin_token
 from src.api.schemas import (
     AdminConfigResponse,
@@ -32,6 +33,8 @@ from src.api.schemas import (
     EvaluationSummary,
     UpdateConfigRequest,
     UpdateConfigResponse,
+    UsageSessionRow,
+    UsageSessionsResponse,
 )
 from src.classifiers import intent_classifier, risk_detector
 from src.rag import chain
@@ -277,4 +280,21 @@ def api_logs(limit: int = Query(200, ge=1, le=1000)) -> ApiLogsResponse:
         started_at=_api_started_at.isoformat(),
         uptime_seconds=uptime,
         lines=list(_log_buffer)[-limit:],
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/usage_sessions — sesiones activas en tiempo real, anonimizado
+# ---------------------------------------------------------------------------
+
+@router.get("/usage_sessions", response_model=UsageSessionsResponse)
+def usage_sessions_endpoint() -> UsageSessionsResponse:
+    """Sesiones activas de Streamlit y Telegram (últimos
+    usage_sessions.IDLE_TIMEOUT_SECONDS de actividad), con duración y
+    tokens por sesión. A propósito no lleva session_id ni nada derivado
+    de él — ver usage_sessions.py y UsageSessionsResponse."""
+    data = usage_sessions.active_by_platform()
+    return UsageSessionsResponse(
+        streamlit=[UsageSessionRow(**row) for row in data["streamlit"]],
+        telegram=[UsageSessionRow(**row) for row in data["telegram"]],
     )

@@ -31,6 +31,7 @@ import hashlib
 import httpx
 import logging
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -101,6 +102,27 @@ logger = logging.getLogger(__name__)
 histories: dict[str, list[dict]] = {}
 
 # ---------------------------------------------------------------------------
+# session_id de "uso en tiempo real": { hash(user_id): uuid4 } — aleatorio,
+# nunca derivado del chat_id real. Se regenera en /start y /reset (cierran
+# la sesión anterior para las métricas: ver src/api/usage_sessions.py, la
+# entrada vieja simplemente deja de recibir turnos y expira sola por
+# inactividad). En RAM únicamente, igual que histories.
+# ---------------------------------------------------------------------------
+
+usage_session_ids: dict[str, str] = {}
+
+
+def _usage_session_id(user_id: int) -> str:
+    key = _hash_id(user_id)
+    if key not in usage_session_ids:
+        usage_session_ids[key] = str(uuid.uuid4())
+    return usage_session_ids[key]
+
+
+def _new_usage_session(user_id: int) -> None:
+    usage_session_ids[_hash_id(user_id)] = str(uuid.uuid4())
+
+# ---------------------------------------------------------------------------
 # Consentimiento de tratamiento de datos: { hash(user_id): "accepted" | "rejected" }
 # Toda nueva sesión (bot recién iniciado, /start o /reset) empieza sin
 # entrada aquí — se exige mostrar el aviso y obtener aceptación explícita
@@ -138,6 +160,8 @@ async def call_chat(message: str, user_id: int) -> dict | None:
         "message": message,
         "history": histories.get(_hash_id(user_id), []),
         "k": 5,
+        "session_id": _usage_session_id(user_id),
+        "platform": "telegram",
     }
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
@@ -177,6 +201,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # hubiera aceptado antes.
     key = _hash_id(update.effective_user.id)
     consent_status.pop(key, None)
+    _new_usage_session(update.effective_user.id)
     await _send_consent_prompt(update)
 
 
@@ -198,6 +223,7 @@ async def consent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         consent_status[key] = "rejected"
         histories.pop(key, None)
         remove_active_user(user.id)
+        usage_session_ids.pop(key, None)
         await query.edit_message_text(FAREWELL_TEXT, reply_markup=None)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -227,6 +253,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     remove_active_user(user_id)
     # /reset también cuenta como nueva sesión — se vuelve a exigir el aviso
     consent_status.pop(key, None)
+    _new_usage_session(user_id)
     await _send_consent_prompt(update)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

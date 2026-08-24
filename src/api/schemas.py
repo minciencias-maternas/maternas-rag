@@ -5,7 +5,7 @@ schemas.py — Modelos Pydantic para la API de Maternas.
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Literal, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +27,20 @@ class ChatRequest(BaseModel):
         default=None,
         ge=1, le=20,
         description="Número de fragmentos RAG a recuperar (default: settings.rag_top_k)",
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Identificador aleatorio de sesión (uuid4), generado por el cliente — "
+            "nunca derivado de un chat_id de Telegram ni de ningún dato real. Solo "
+            "alimenta el conteo de 'uso en tiempo real' (ver GET /admin/usage_sessions); "
+            "opcional, si no viene el turno simplemente no se cuenta."
+        ),
+    )
+    platform: Literal["streamlit", "telegram"] = Field(
+        default="streamlit",
+        description="Origen del turno, solo para agrupar en /admin/usage_sessions.",
     )
 
 
@@ -298,3 +312,21 @@ class BotStatusResponse(BaseModel):
 
 class BotLogsResponse(BaseModel):
     lines: list[str]
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/usage_sessions
+# ---------------------------------------------------------------------------
+# Vista de "uso en tiempo real" para la subsección de Métricas. A propósito
+# NO lleva ningún identificador de sesión ni derivado (hash, chat_id, etc.):
+# el objetivo es contar sesiones activas y ver duración/tokens por sesión
+# sin que sea posible diferenciar una sesión de otra entre dos lecturas.
+
+class UsageSessionRow(BaseModel):
+    active_seconds: float
+    tokens_total:   int
+
+
+class UsageSessionsResponse(BaseModel):
+    streamlit: list[UsageSessionRow]
+    telegram:  list[UsageSessionRow]
