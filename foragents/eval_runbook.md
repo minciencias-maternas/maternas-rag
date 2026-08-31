@@ -4,10 +4,19 @@
 > Ver también `foragents/eval_setup_critico.md` para decisiones arquitectónicas
 > y resultados históricos.
 
+> ⚠️ **Actualización 28-ago-2026:** **Config F es ahora la config de producción**
+> (reemplaza a Config D). Retoma BM25 — pero sobre `maternaqaes_lm` + `upload`
+> (~5.4k frags ES), no sobre Multiclinsum (que ya no está en el índice). Medido con
+> `src/evaluation/retrieval_eval.py` (nuevo, sin juez LLM): híbrido RRF R@5=0.915 vs
+> denso puro R@5=0.838 sobre los 328 pares de MaternaQA-es test. Además,
+> `ingest_maternaqaes_lm.py --min-clinical-score 8` (antes 15) eliminó el techo de
+> alcanzabilidad: 72.6% → 100% de los pares del golden set tienen su chunk-oro en el
+> índice. Índice: 253,469 → 255,625 vectores. Detalle completo en
+> `foragents/retrieval_arquitecturas_configs.md` (Config F) y `qa_technical.md`.
+
 > ⚠️ **Actualización 13-ago-2026:** `textbook` y `multiclinsum` fueron removidos del
-> índice FAISS por licencia (`qa_technical.md` Q31). **Config D es ahora la config de
-> producción** (reemplaza a Config B/C referenciadas abajo). Índice: 380,745 → 253,455
-> vectores. `src/rag/bm25_index.py` fue eliminado — ya no hay capa BM25.
+> índice FAISS por licencia (`qa_technical.md` Q31). Índice: 380,745 → 253,455
+> vectores en ese momento (ver arriba para el estado actual).
 
 ---
 
@@ -39,34 +48,56 @@ OPENROUTER_KEY=sk-or-...    # backup OpenRouter (opcional, inestable)
 
 | Archivo | Activar con | Descripción |
 |---|---|---|
-| `src/rag/retriever_configA.py` | `copy configA retriever.py` | FAISS puro, top-k global sin filtro |
-| `src/rag/retriever_configB.py` | `copy configB retriever.py` | FAISS+BM25 híbrido (producción actual) |
-| `src/rag/retriever_configC.py` | `copy configC retriever.py` | FAISS+BM25 + corpus obstetrics ES |
-| `src/rag/retriever.py` | — | **Activo en producción — Config B** |
+| `src/rag/retriever_configA.py` | `copy configA retriever.py` | FAISS puro, top-k global sin filtro (historico, no reproducible tal cual) |
+| `src/rag/retriever_configB.py` | `copy configB retriever.py` | FAISS+BM25 hibrido sobre Multiclinsum (historico, dataset removido) |
+| `src/rag/retriever_configC.py` | `copy configC retriever.py` | FAISS+BM25 + corpus obstetrics ES (historico) |
+| `src/rag/retriever_configD.py` | `copy configD retriever.py` | denso puro, sin textbook/Multiclinsum/BM25 |
+| `src/rag/retriever_configF.py` | `copy configF retriever.py` | denso + BM25 sobre maternaqaes_lm/upload (produccion) |
+| `src/rag/retriever.py` | — | **Activo en producción — Config F** |
 
-**Siempre restaurar Config B al terminar una evaluación:**
+**Siempre restaurar Config F al terminar una evaluación:**
 ```bash
-copy src\rag\retriever_configB.py src\rag\retriever.py
+copy src\rag\retriever_configF.py src\rag\retriever.py
 ```
 
 ---
 
 ## Corpus en el índice FAISS
 
+> ⚠️ Tabla desactualizada tras la remoción de textbook/multiclinsum (13-ago) y la
+> re-ingesta de maternaqaes_lm con umbral bajado (28-ago). Estado actual real:
+
 | Dataset | Chunks | Idioma | Fuente |
 |---|---|---|---|
-| textbook | ~135k | EN | 18 libros médicos |
 | medmcqa | ~187k | EN | Exámenes médicos India |
-| medqa_* | ~53k | EN/ZH | USMLE + Taiwan + Mainland |
-| multiclinsum | ~51.8k | ES | Casos clínicos reales |
-| **maternaqaes_lm** | **5.063** | **ES** | **Corpus obstetrico colombiano (train+val, rechunked 336tok)** |
-| **Total** | **~380.455** | — | — |
+| medqa_* | ~61k | EN/ZH | USMLE + Taiwan + Mainland |
+| **maternaqaes_lm** | **~7.5k** | **ES** | **Corpus obstetrico colombiano (train+val+test, rechunked ~400tok)** |
+| upload | variable | ES | Documentos subidos desde el panel |
+| **Total** | **255.625** | — | — |
 
-**IMPORTANTE sobre maternaqaes_lm:**
-- Solo contiene splits `train` y `validation` del corpus LM
-- El split `test` fue excluido deliberadamente para evitar data leakage
-- Los 3 PDFs del split test son: `GPC-Atencion-Prenatal-de-Bajo-Riesgo-2023.pdf`, `vol831-1.pdf`, `4142_stamped.pdf`
-- Re-chunkeado a ~336 tok con `clinical_score >= 15` (sin intro/biblio)
+**IMPORTANTE sobre maternaqaes_lm — data leakage confirmado, no nuevo:**
+- Los 3 PDFs del split `test` del corpus LM (`GPC-Atencion-Prenatal-de-Bajo-Riesgo-2023.pdf`,
+  `vol831-1.pdf`, `4142_stamped.pdf`) son **exactamente** los 3 `source_pdf` de los que
+  sale el golden set de evaluación (`maternaqa_test.jsonl`, 328 pares, repo
+  `JhonHander/MaternaQA-es`) — verificado por intersección exacta, no coincidencia.
+  Las preguntas de evaluación se generaron a partir de estos mismos documentos.
+- `ingest(include_test=True)` es el **default histórico** (ya lo era antes de esta
+  sesión: a `clinical_score>=15` el split test ya aportaba 290 chunks). Esto significa
+  que TODOS los `eval_report_config{A..F}_*.md` publicados evalúan retrieval con el
+  documento fuente de la pregunta ya en el índice — no es una medida de generalización
+  a documentos nunca vistos, es una medida de "¿encuentra el pasaje correcto dentro de
+  documentos que ya indexó?", que es lo que un sistema RAG desplegado necesita.
+- La comparación contra el baseline publicado de MaternaQA-es (`faithfulness` train
+  0.7726 / test 0.7132 en `eval_pipeline.py`) hereda esta asimetría: no se sabe si ese
+  baseline tuvo o no acceso a los mismos documentos al generar sus respuestas. Tratarla
+  como comparación exacta es optimista; ya lo era antes de este cambio.
+- `--exclude-test` existe para una comparación sin esta leakage, pero nunca se ha usado
+  en producción. Bajar `--min-clinical-score` a 8 (28-ago-2026) no introdujo el
+  problema — solo recuperó más chunks (score 8-14) de los mismos PDFs que ya estaban
+  parcialmente indexados, cerrando el hueco de cobertura que antes hacía inalcanzables
+  90/328 pares del golden set.
+- Re-chunkeado a ~400 tok con `clinical_score >= 8` (antes 15 — ver
+  `foragents/qa_technical.md` para el análisis del techo de recall que motivó bajarlo)
 - Script de ingestión: `src/ingestion/ingest_maternaqaes_lm.py`
 
 ---

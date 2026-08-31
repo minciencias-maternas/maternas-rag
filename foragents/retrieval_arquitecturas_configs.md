@@ -4,11 +4,17 @@ Documento de referencia para comparar y replicar las dos configuraciones de retr
 evaluadas en el sistema. Cada configuración puede restaurarse siguiendo los pasos de código
 indicados. Los resultados de Ragas quedan registrados en `evaluation_reports/`.
 
-> ⚠️ **Actualización 13-ago-2026:** `textbook` y `multiclinsum` fueron removidos del
-> índice FAISS por licencia (`qa_technical.md` Q28/Q31). **Config D** (`medmcqa` +
-> `medqa_*` + `maternaqaes_lm`, sin BM25) es la config activa en producción — ver
-> `src/rag/retriever_configD.py`. Config A y B descritas abajo ya no son reproducibles
-> tal cual: dependen de fuentes que ya no están en el índice (380,745 → 253,455 vectores).
+> ⚠️ **Actualización 28-ago-2026:** **Config F** (denso + BM25 sobre `maternaqaes_lm` +
+> `upload`) es la config activa en producción — ver `src/rag/retriever_configF.py`.
+> BM25 vuelve, corrigiendo la premisa de Config B: ya no filtra ruido de Multiclinsum
+> (removido por licencia el 13-ago), sino que desempata léxicamente dentro del corpus
+> en español. Medido con `src/evaluation/retrieval_eval.py` (sin juez LLM, 328 pares):
+> Recall@5 sube de 0.838 (denso, Config D) a 0.915 (híbrido RRF). Además,
+> `ingest_maternaqaes_lm.py --min-clinical-score 8` (antes 15) llevó la alcanzabilidad
+> del golden set de 72.6% a 100% — ver la sección Config F más abajo para el detalle
+> completo, incluyendo un data leakage estructural preexistente que hay que tener en
+> cuenta al leer estos números. Config A/B/C ya no son reproducibles tal cual: dependen
+> de fuentes que ya no están en el índice. Índice actual: 255.625 vectores.
 
 ---
 
@@ -188,6 +194,118 @@ top-5 densos + top-2 BM25 → LLM
 - **Context recall**: sigue siendo bajo (el corpus no contiene los PDFs de MaternaQA-es),
   pero la capa BM25 puede mejorar marginalmente cuando la query usa términos
   específicos que aparecen en Multiclinsum.
+
+---
+
+## Config F — Híbrido denso + BM25 sobre el corpus en español (producción actual)
+
+**Commit de referencia:** ver git log de `src/rag/retriever_configF.py`
+**Fecha:** 28-ago-2026
+**Archivo activo:** `src/rag/retriever.py`
+
+### Descripción
+
+Retoma el híbrido de Config B, pero corrigiendo su premisa. Config B usaba BM25 para
+*filtrar ruido*: Multiclinsum (casos clínicos) contaminaba el top-k denso con
+fragmentos irrelevantes. Ese problema ya no existe — Multiclinsum y textbook salieron
+del índice el 13-ago-2026 (Config D). Medido sobre el índice actual: en el último eval
+de producción, el 100% de los fragmentos recuperados ya venían de `maternaqaes_lm`
+(0 de MedMCQA/MedQA, que son el 97,8% del índice). `multilingual-e5-base` ya separa
+bien las fuentes en español de las de inglés/chino sin ayuda de BM25.
+
+Lo que BM25 aporta aquí es distinto: **desempate léxico dentro del corpus correcto**.
+El corpus en español son solo ~5.400 fragmentos (`maternaqaes_lm` + `upload`). Ahí BM25
+gana en fármacos, dosis, cifras y siglas exactas — donde el embedding denso difumina
+sinónimos y pierde precisión numérica.
+
+### Flujo de retrieve()
+
+```
+query ──┬──► embed("query: " + query) → FAISS.search(pool=20) → filtrar DENSE_SOURCES
+        │
+        └──► BM25.search(query, pool=20) sobre maternaqaes_lm + upload (~5.400 frags)
+
+fusión (RRF k=10 por defecto, o ponderada min-max) → top-k final
+```
+
+`DENSE_SOURCES` hoy coincide con el 100% de las fuentes del índice (no hay textbook ni
+Multiclinsum) — el filtro se mantiene como red de seguridad, no porque haga algo hoy.
+
+### Archivos
+
+- `src/rag/bm25_index.py` — singleton BM25 sobre `LEXICAL_SOURCES = {maternaqaes_lm, upload}`.
+  No relee `metadata.pkl`: reusa `FAISSStore.metadata` ya cargado. Se reconstruye
+  automáticamente si `store.mutation_seq` cambia (documento subido/activado/desactivado
+  desde el panel) — a diferencia de la versión de Config B, si respeta el flag `active`.
+- `src/rag/retriever.py` — `_retrieve_dense`, `_retrieve_bm25`, `_fuse_rrf`,
+  `_fuse_weighted`, `_doc_identity` (deduplicación por `(source_dataset, doc_id, chunk_id)`,
+  no por `chunk_id` solo — no está garantizado único entre datasets).
+- `src/settings.py` — `rag_fusion_strategy` (`"rrf"` por defecto), `rag_fusion_rrf_k`,
+  `rag_fusion_dense_weight`, `rag_dense_pool`, `rag_bm25_pool`.
+- `src/evaluation/retrieval_eval.py` — harness determinista (sin juez LLM) usado para
+  elegir estrategia de fusión y validar el impacto del umbral de ingestión (ver abajo).
+
+### Resultados medidos (retrieval_eval.py, 328 pares, sin juez LLM)
+
+| Estrategia | R@5 | R@10 | MRR@10 | nDCG@10 |
+|---|---:|---:|---:|---:|
+| Denso (Config D) | 0.838 | 0.902 | 0.647 | 0.710 |
+| BM25 solo | 0.860 | 0.930 | 0.717 | 0.769 |
+| **Híbrido RRF k=10 (default)** | **0.915** | **0.960** | 0.729 | 0.786 |
+| Híbrido ponderado (denso=0.5) | 0.909 | 0.960 | **0.755** | **0.805** |
+
+RRF y ponderada quedan a un pelo — RRF gana en R@5, ponderada en MRR/nDCG. Se dejan
+ambas implementadas y configurables; el default es RRF por robustez (no depende de que
+los scores de FAISS-IP y BM25 sean comparables en escala, cosa que no está garantizada).
+
+Reporte completo: `evaluation_reports/retrieval_eval_configF_vs_configD_*.md`.
+
+### Resultados Ragas (cadena completa, LLM judge) — confirman el efecto medido arriba
+
+| Métrica | Config D (19-ago, n=15) | **Config F (28-ago, n=39)** | Δ |
+|---|---:|---:|---:|
+| `faithfulness` | 0.3915 | **0.6173** | +0.226 |
+| `answer_correctness` | 0.6362 | **0.7876** | +0.151 |
+| `answer_relevancy` | 0.8101 | **0.9396** | +0.130 |
+| `context_recall` | 0.4222 | **0.6368** | +0.215 |
+| `context_precision` | 0.3359 | **0.5608** | +0.225 |
+
+Mismo generador (`gpt-oss-120b`) y mismo juez (Cerebras `gemma-4-31b`) en ambas corridas —
+la diferencia es atribuible al retrieval híbrido + la eliminación del techo de
+alcanzabilidad, no a un cambio de modelo. Reporte completo:
+`evaluation_reports/eval_report_configF_20260828_173548.md`.
+
+### Cambio acompañante — techo de alcanzabilidad eliminado
+
+Independiente del retrieval, `ingest_maternaqaes_lm.py --min-clinical-score 8` (antes
+15, hardcodeado) recuperó 2.156 chunks nuevos vía re-ingesta incremental (dedup por
+`chunk_id`, sin reconstruir el índice). Efecto: 90 de los 328 pares del golden set
+tenían su chunk-oro descartado por el umbral (score 8-14) y ahora están en el índice.
+Alcanzabilidad: 72.6% → 100%. Índice: 253.469 → 255.625 vectores.
+
+### ⚠️ Data leakage estructural — preexistente, no introducido por este cambio
+
+Los 3 PDFs del split `test` del corpus LM (`GPC-Atencion-Prenatal-de-Bajo-Riesgo-2023.pdf`,
+`vol831-1.pdf`, `4142_stamped.pdf`) son **exactamente** los 3 `source_pdf` de los que sale
+el golden set de evaluación (`maternaqa_test.jsonl`) — verificado por intersección exacta.
+`ingest_maternaqaes_lm.py` incluye ese split por default (`include_test=True`), y ya lo
+hacía antes de este cambio (a `clinical_score>=15` el split test ya aportaba 290 chunks).
+
+Esto significa que **todos** los `eval_report_config{A..F}_*.md` publicados evalúan
+retrieval con el documento fuente de cada pregunta ya en el índice. Es una medida válida
+de "¿encuentra el pasaje correcto dentro de documentos que ya indexó?" (lo relevante para
+producción), pero **no** de generalización a documentos nunca vistos, y la comparación
+contra el baseline publicado de MaternaQA-es (`eval_pipeline.py`, `faithfulness` train
+0.7726 / test 0.7132) hereda esa asimetría — no se sabe si ese baseline tuvo acceso a los
+mismos documentos. `--exclude-test` existe para una comparación sin esta leakage pero
+nunca se ha usado en producción.
+
+### Qué NO arregla
+
+`faithfulness` (0.3915 en el último reporte de producción) es el peor número medido y es
+un problema de **generación**, no de retrieval: el LLM responde desde conocimiento general
+en vez de anclarse en los fragmentos entregados. Mejor contexto ayuda pero no lo resuelve
+— es el siguiente candidato a atacar, en el prompt de `src/rag/chain.py`.
 
 ---
 

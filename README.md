@@ -11,7 +11,8 @@ Chatbot conversacional basado en arquitectura RAG orientado a madres gestantes. 
 | Capa | Tecnología |
 |---|---|
 | Embedding | `intfloat/multilingual-e5-base` (768 dims, ES/EN/ZH) en CUDA |
-| Vector store | FAISS `IndexFlatIP` — 253,455 vectores |
+| Vector store | FAISS `IndexFlatIP` — 255,625 vectores |
+| Retrieval | híbrido denso (FAISS) + léxico (BM25 sobre `maternaqaes_lm`+`upload`), fusión RRF |
 | LLM | `openai/gpt-oss-120b` vía Groq API |
 | API | FastAPI + uvicorn |
 | UI | Streamlit |
@@ -153,7 +154,7 @@ Las citas dentro de la respuesta usan marcadores numerados `[n]` en el texto, co
 
 ## Retrieval
 
-El índice tiene 253,455 vectores de tres fuentes (`medmcqa`, `medqa_us`/`medqa_taiwan`/`medqa_mainland`, `maternaqaes_lm`), todas recuperadas por búsqueda densa FAISS (similitud coseno). `textbook` y `multiclinsum_*` fueron removidos del índice por riesgo de licencia — ver `foragents/qa_technical.md` (Q31).
+El índice tiene 255,625 vectores de tres fuentes (`medmcqa`, `medqa_us`/`medqa_taiwan`/`medqa_mainland`, `maternaqaes_lm`). `textbook` y `multiclinsum_*` fueron removidos del índice por riesgo de licencia — ver `foragents/qa_technical.md` (Q31). Desde el 28-ago-2026 (Config F, Q35), `medmcqa`/`medqa_*` se recuperan por búsqueda densa FAISS; `maternaqaes_lm`/`upload` (el corpus en español) se recuperan por fusión híbrida densa+BM25 (RRF), que sube Recall@5 de 0.838 a 0.915 sobre el golden set de MaternaQA-es (medido sin juez LLM, ver `src/evaluation/retrieval_eval.py`).
 
 ## Preguntas de clarificación
 
@@ -248,33 +249,42 @@ El sistema se evalúa con el framework **Ragas** sobre el benchmark **MaternaQA-
 
 ```bash
 # Fase 1: generar respuestas
-python src/evaluation/eval_pipeline.py --config configD --sample 15 --generate-only
+python src/evaluation/eval_pipeline.py --config configF --sample 40 --generate-only
 
 # Fase 2: evaluar con Ragas
-python src/evaluation/eval_pipeline.py --evaluate-only evaluation_reports/eval_raw_configD_<TIMESTAMP>.json
+python src/evaluation/eval_pipeline.py --evaluate-only evaluation_reports/eval_raw_configF_<TIMESTAMP>.json
+
+# Alternativa sin juez LLM, cubre los 328 pares del golden set en ~1 min:
+python -m src.evaluation.retrieval_eval --compare dense,bm25,hybrid
 ```
 
 Ver guía completa en `foragents/eval_runbook.md`.
 
-### Mejores resultados obtenidos — Config D (producción actual)
+### Mejores resultados obtenidos — Config F (producción actual)
 
-Configuración: FAISS densa pura sobre `medmcqa` + `medqa_*` + `maternaqaes_lm` (sin `textbook` ni `multiclinsum`, removidos por licencia), evaluado sobre 14 pares sin preguntas de clarificación.
+Configuración: híbrido denso+BM25 (fusión RRF) sobre `medmcqa`+`medqa_*`+`maternaqaes_lm`+`upload`, con el umbral de calidad de ingesta bajado de 15 a 8. Evaluado con Ragas sobre 39 pares (mismo generador `gpt-oss-120b` y juez Cerebras `gemma-4-31b` que la corrida de Config D).
 
-| Métrica | Config D | Config C (con textbook+multiclinsum) | Baseline MaternaQA-es |
+| Métrica | Config F | Config D (denso puro) | Baseline MaternaQA-es |
 |---|:---:|:---:|:---:|
-| `faithfulness` | **0.497** | 0.456 | 0.713 |
-| `answer_relevancy` | **0.733** | 0.816 | 0.558 |
-| `answer_correctness` | **0.551** | 0.532 | — |
-| `context_recall` | **0.452** | 0.452 | — |
-| `context_precision` | **0.360** | 0.388 | — |
-| `latency_avg_s` | ~9.6 s | ~10.2 s | — |
+| `faithfulness` | **0.617** | 0.392 | 0.713 |
+| `answer_relevancy` | **0.940** | 0.810 | 0.558 |
+| `answer_correctness` | **0.788** | 0.636 | — |
+| `context_recall` | **0.637** | 0.422 | — |
+| `context_precision` | **0.561** | 0.336 | — |
+| `latency_avg_s` | ~16.1 s | ~12.5 s | — |
 
-Remover `textbook` y `multiclinsum` no cambió las métricas de forma significativa (deltas dentro del margen de ruido, std~0.25 con 14-15 pares) — la brecha en `faithfulness` frente al baseline se debe principalmente a que los PDFs exactos que generaron el benchmark MaternaQA-es (split test) no están indexados, para evitar data leakage.
+Las 5 métricas mejoran a la vez frente a Config D. Reporte completo: `evaluation_reports/eval_report_configF_20260828_173548.md`. Medido también sin juez LLM sobre los 328 pares del golden set (`src/evaluation/retrieval_eval.py`): Recall@5 sube de 0.838 (denso) a 0.915 (híbrido) — ver `foragents/qa_technical.md` Q35 para el detalle.
+
+> ⚠️ **Corrección:** contrario a lo que decía una versión anterior de esta sección, los PDFs exactos que generaron el benchmark MaternaQA-es (split `test` del corpus LM: `GPC-Atencion-Prenatal-de-Bajo-Riesgo-2023.pdf`, `vol831-1.pdf`, `4142_stamped.pdf`) **sí están indexados** — `ingest_maternaqaes_lm.py` los incluye por default desde antes de esta actualización. Es un data leakage estructural preexistente, no introducido aquí: todas las evaluaciones Ragas publicadas (incluidas las de Config D/F) miden retrieval con el documento fuente de cada pregunta ya en el índice. Detalle en `foragents/qa_technical.md` Q35.
+
+## Fine-tuning de modelos generadores
+
+Este proyecto **no utiliza modelos LLM generadores fine-tuneados**: `gpt-oss-120b` (Groq) y el juez `gemma-4-31b` (Cerebras) se usan tal cual los sirve el proveedor, sin ajuste de pesos. En etapas previas del desarrollo se probó fine-tunear algunos LLMs, pero no se incorporó a la versión actual por límites de infraestructura (requeriría GPU dedicada para entrenamiento e inferencia) y por el alto costo computacional frente a servir modelos ya entrenados vía API. La especialización de dominio se delega al retrieval (corpus obstétrico + fusión híbrida BM25/denso) y al prompting. Detalle en `foragents/qa_technical.md` Q36.
 
 ## Siguientes mejoras
 
-- **Reranker cross-encoder local** (`BAAI/bge-reranker-v2-m3`) — recuperar k=20 candidatos y reranquear a top-5 antes del LLM; mejora `context_precision` sin costo de API ni latencia significativa
-- **System prompt restrictivo** — instruir al LLM a responder solo con información de los fragmentos recuperados y declarar explícitamente cuando no tiene suficiente contexto; sube `faithfulness` en pares donde el retrieval ya es correcto
+- **System prompt restrictivo** — instruir al LLM a responder solo con información de los fragmentos recuperados y declarar explícitamente cuando no tiene suficiente contexto; `faithfulness` (0.617) sigue siendo la métrica más baja y es un problema de generación, no de retrieval — **no implementado**
+- **Reranker cross-encoder local** (`BAAI/bge-reranker-v2-m3`) — reranquear el pool de 20 candidatos antes de la fusión; mejoraría `context_precision` sin costo de API — **no implementado**. El pool de candidatos ya subió a k=20 por lado (denso y BM25) como parte del híbrido, y la fusión RRF/ponderada cumple un rol de reordenamiento similar sin el costo de un cross-encoder
 
 ~~**HyDE (Hypothetical Document Embeddings)**~~ — probado en `src/rag/retriever_configE.py` y evaluado contra Config D (14 pares, ver `foragents/qa_technical.md` Q32): todos los deltas de métricas caen dentro del margen de ruido de la evaluación (ninguna mejora de forma clara, dos empeoran ligeramente), mientras que el costo es real — +~1.3s de latencia por turno y agotó la cuota diaria de Groq a mitad de una corrida de solo 15 pares. **No se adoptó en producción.**
 

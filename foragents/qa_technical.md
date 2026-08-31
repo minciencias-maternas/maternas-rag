@@ -1612,4 +1612,101 @@ Se reinició la API (proceso `uvicorn`, sin `--reload`, con el código viejo en 
 
 ---
 
-*Última actualización: 19 de agosto de 2026*
+## Q35: ¿A estas alturas se puede implementar BM25 + denso sobre los datasets que hay? ¿Qué mejora cabe esperar, y hace falta algo más?
+
+**Contexto:** Se pidió reevaluar el híbrido FAISS+BM25 (existió en Config B, commit `a6baf49`, eliminado en `67145ee` por licencia — Multiclinsum salió del índice, no BM25 en sí). Antes de implementar nada se midió el sistema real para no adivinar el impacto.
+
+### Diagnóstico previo — dos hallazgos que cambiaron el plan
+
+1. **El ruido ya no es el problema que BM25 resolvía en Config B.** En el último eval de producción (`eval_raw_configD_oss120b_20260819_113326.json`), el 100% de los fragmentos recuperados (75/75) ya venían de `maternaqaes_lm`. MedMCQA+MedQA son el 97,8% del índice y nunca entran al top-5 con preguntas en español — `multilingual-e5-base` ya los separa sin ayuda. Un BM25 "filtra-ruido" no tendría nada que filtrar.
+2. **Hay un techo duro de alcanzabilidad.** Uniendo `chunk_id` (golden set) con `parent_chunk_id` (índice), solo 238/328 pares (72,6%) tenían su chunk-oro en el índice. Los 90 faltantes tenían `clinical_score` 8-14, descartados por `MIN_CLINICAL_SCORE = 15` en `ingest_maternaqaes_lm.py`. Ningún retriever puede superar ese techo sin tocar la ingesta.
+
+### Qué se implementó — Config F
+
+- **BM25 vuelve, pero sobre `maternaqaes_lm` + `upload`** (~5.400 frags), no sobre Multiclinsum. Aporta desempate léxico *dentro* del corpus correcto (fármacos, dosis, cifras, siglas), no filtrado de fuentes.
+- **Fusión configurable** (RRF por defecto, ponderada como alternativa) vía `src/settings.py`.
+- **`ingest_maternaqaes_lm.py --min-clinical-score 8`** (antes 15, hardcodeado) — re-ingesta incremental (dedup por `chunk_id`, sin reconstruir el índice) que recuperó 2.156 chunks y cerró el techo de alcanzabilidad.
+- **`src/evaluation/retrieval_eval.py`** (nuevo) — harness determinista sin juez LLM, para poder medir estos deltas: con 15-20 pares y un juez LLM, Ragas no distingue una mejora de Recall@5 de unos pocos puntos del ruido de evaluación (~0.25 std, mismo argumento que usó `67145ee`).
+
+### Resultados medidos — retrieval solo, sin juez LLM (328 pares)
+
+| Estrategia | R@5 | R@10 | MRR@10 |
+|---|---:|---:|---:|
+| Denso (Config D) | 0.838 | 0.902 | 0.647 |
+| BM25 solo | 0.860 | 0.930 | 0.717 |
+| **Híbrido RRF (Config F)** | **0.915** | **0.960** | 0.729 |
+
+Alcanzabilidad del golden set: 72,6% → 100% tras bajar el umbral de ingesta.
+
+### Resultados medidos — Ragas, cadena completa (Config F, n=39, `gpt-oss-120b`/Cerebras `gemma-4-31b`)
+
+Corrida real tras implementar todo lo anterior (`eval_report_configF_20260828_173548.md`),
+comparada contra la última corrida de producción antes de este cambio
+(`eval_report_configD_oss120b_20260819_113326.md`, n=15, mismo generador):
+
+| Métrica | Config D (19-ago) | **Config F (28-ago)** | Δ |
+|---|---:|---:|---:|
+| `faithfulness` | 0.3915 | **0.6173** | +0.226 |
+| `answer_correctness` | 0.6362 | **0.7876** | +0.151 |
+| `answer_relevancy` | 0.8101 | **0.9396** | +0.130 |
+| `context_recall` | 0.4222 | **0.6368** | +0.215 |
+| `context_precision` | 0.3359 | **0.5608** | +0.225 |
+
+Las 5 métricas mejoran a la vez, sobre una muestra más grande (39 vs 15 pares). El salto no
+se puede atribuir a un cambio de generador (ambos usan `gpt-oss-120b`) — es el efecto
+combinado del híbrido y de cerrar el techo de alcanzabilidad. `answer_relevancy` (0.9396) es
+el valor más alto registrado en toda la serie de evaluaciones del proyecto. `faithfulness`
+mejoró más de lo anticipado (se esperaba que solo mejorara retrieval, no generación) —
+hipótesis: un contexto más preciso y completo facilita que el LLM se ancle en él sin
+necesidad de tocar el prompt — pero sigue por debajo del baseline (0.7132), confirmando que
+el problema de generación identificado abajo sigue sin resolverse.
+
+### ⚠️ Hallazgo colateral: data leakage estructural, preexistente
+
+Verificado por intersección exacta: los 3 PDFs del split `test` del corpus LM
+(`GPC-Atencion-Prenatal-de-Bajo-Riesgo-2023.pdf`, `vol831-1.pdf`, `4142_stamped.pdf`)
+son los mismos 3 `source_pdf` de los que sale el golden set de evaluación completo.
+`ingest_maternaqaes_lm.py` incluye ese split por default (`include_test=True`) desde
+antes de este cambio — a umbral 15 ya aportaba 290 chunks. Esto significa que **todos**
+los `eval_report_config{A..F}_*.md` publicados, no solo este, evalúan con el documento
+fuente de cada pregunta ya en el índice: es una medida honesta de "¿el sistema
+desplegado encuentra el pasaje correcto?", pero no de generalización a documentos
+nunca vistos, y compararla sin más contra el baseline publicado de MaternaQA-es
+(`eval_pipeline.py`) es optimista. No se corrigió — es una decisión de diseño ya
+tomada por el proyecto (`--exclude-test` existe para el caso sin leakage, pero
+nunca se ha usado en producción) y está fuera del alcance de este cambio, pero
+quedó sin documentar hasta ahora.
+
+### Qué NO se resolvió
+
+`faithfulness` = 0.3915 en el último reporte de producción es el número más bajo y es
+un problema de **generación** (el LLM responde desde conocimiento general en vez de
+anclarse en los fragmentos), no de retrieval. Mejor contexto ayuda pero no lo arregla.
+Es el siguiente candidato — el prompt de `src/rag/chain.py`.
+
+**Archivos modificados/creados:**
+- `src/rag/bm25_index.py` — recreado sobre `maternaqaes_lm`+`upload`, respeta `active`/`mutation_seq`
+- `src/rag/retriever_configF.py` → copiado a `src/rag/retriever.py` (producción)
+- `src/settings.py` — parámetros de fusión (`rag_fusion_strategy`, `rag_fusion_rrf_k`, `rag_fusion_dense_weight`, `rag_dense_pool`, `rag_bm25_pool`)
+- `src/ingestion/ingest_maternaqaes_lm.py` — `--min-clinical-score` parametrizable (default 15 sin cambios)
+- `src/evaluation/retrieval_eval.py` — nuevo harness determinista
+- `tests/test_bm25_index.py`, `tests/test_retriever_fusion.py` — nuevos (27 tests)
+- `requirements.txt` — `rank-bm25==0.2.2` reinstaurado
+- `foragents/retrieval_arquitecturas_configs.md`, `foragents/eval_runbook.md` — sección Config F
+
+---
+
+## Q36: ¿Se usan modelos generadores fine-tuneados en este proyecto?
+
+**No.** Los modelos generadores (`openai/gpt-oss-120b` vía Groq para generación, `gemma-4-31b` vía Cerebras como juez de Ragas) se usan **tal cual los sirve el proveedor**, sin ajuste de pesos — la especialización de dominio se delega al RAG (corpus obstétrico + retrieval híbrido denso/BM25, ver [[Q35]]) y al prompting, no al fine-tuning.
+
+En etapas previas del desarrollo del proyecto sí se probó fine-tunear algunos LLMs. Se decidió no incorporar esa vía en la versión actual por dos motivos:
+
+- **Infraestructura:** entrenar y luego servir en producción un modelo fine-tuneado requiere GPU dedicada tanto para el entrenamiento como para la inferencia — capacidad que excede la disponible para este proyecto.
+- **Costo computacional:** el cómputo de entrenar y mantener un modelo propio es significativamente mayor que el de consumir modelos ya entrenados vía API, sin que la ganancia de calidad esperada justifique ese costo frente al enfoque de retrieval adoptado.
+
+Esto mantiene el sistema reproducible y operable sin infraestructura de entrenamiento propia. Ver también la fila "Sin fine-tuning" en la tabla de decisiones técnicas de `docs/DOCUMENTACION_oss120b_20260824.md` (§16).
+
+---
+
+*Última actualización: 28 de agosto de 2026*

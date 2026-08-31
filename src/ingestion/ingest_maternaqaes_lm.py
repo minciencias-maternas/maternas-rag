@@ -67,8 +67,17 @@ CHUNK_SIZE_CHARS    = 400 * 4   # 1600 chars
 CHUNK_OVERLAP_CHARS = 80  * 4   # 320 chars
 MIN_CHUNK_CHARS     = 100       # descartar fragmentos muy cortos
 
-# Filtro de calidad: solo chunks con clinical_score >= este umbral
-# Descarta introducciones, bibliografias y secciones administrativas
+# Filtro de calidad: solo chunks con clinical_score >= este umbral.
+# Descarta introducciones, bibliografias y secciones administrativas.
+#
+# 15 es el valor historico (produccion hasta 2026-08). Analisis posterior
+# (retrieval_eval.py, ver foragents/qa_technical.md) mostro que descarta 90
+# de los 328 pares del golden set de evaluacion — su chunk-oro tiene
+# clinical_score 8-14 y nunca llega al indice, poniendo un techo duro de
+# 72.6% en cualquier metrica de recall sin importar el retriever usado.
+# Se mantiene 15 como default para no romper la reproducibilidad de los
+# reportes ya publicados (eval_report_config{A..E}_*.md); usar
+# --min-clinical-score 8 para la re-ingesta que elimina ese techo.
 MIN_CLINICAL_SCORE  = 15
 
 _splitter = RecursiveCharacterTextSplitter(
@@ -105,14 +114,14 @@ def _download_jsonl(url: str, split_name: str) -> list[dict]:
     return records
 
 
-def _to_documents(record: dict) -> list[Document]:
+def _to_documents(record: dict, min_clinical_score: int = MIN_CLINICAL_SCORE) -> list[Document]:
     """
     Convierte un registro del LM dataset en UNO O MAS Documents
     aplicando re-chunking a ~400 tokens con RecursiveCharacterTextSplitter.
 
     Filtros aplicados:
       - Texto < 50 chars: descartado
-      - clinical_score < MIN_CLINICAL_SCORE: descartado (intro, biblio, admin)
+      - clinical_score < min_clinical_score: descartado (intro, biblio, admin)
       - Sub-chunks < MIN_CHUNK_CHARS tras el split: descartados
     """
     text  = record.get("text", "").strip()
@@ -121,7 +130,7 @@ def _to_documents(record: dict) -> list[Document]:
 
     if not text or len(text) < 50:
         return []
-    if score < MIN_CLINICAL_SCORE:
+    if score < min_clinical_score:
         return []
 
     base_meta = {
@@ -177,11 +186,18 @@ def _get_existing_chunk_ids(store: FAISSStore) -> set[str]:
 # Ingestion principal
 # ---------------------------------------------------------------------------
 
-def ingest(include_test: bool = True, dry_run: bool = False) -> None:
+def ingest(
+    include_test: bool = True,
+    dry_run: bool = False,
+    min_clinical_score: int = MIN_CLINICAL_SCORE,
+) -> None:
     sep = "=" * 62
     print(sep)
     print("  Ingestando MaternaQA-es LM corpus al indice FAISS")
     print(f"  Splits: train + validation" + (" + test" if include_test else " (sin test)"))
+    print(f"  min_clinical_score: {min_clinical_score}" + (
+        " (default)" if min_clinical_score == MIN_CLINICAL_SCORE else " (override via CLI)"
+    ))
     if dry_run:
         print("  MODO DRY-RUN: no se modificara el indice")
     print(sep)
@@ -209,16 +225,16 @@ def ingest(include_test: bool = True, dry_run: bool = False) -> None:
         if not text or len(text) < 50:
             skipped_short += 1
             continue
-        if score < MIN_CLINICAL_SCORE:
+        if score < min_clinical_score:
             skipped_score += 1
             continue
-        docs = _to_documents(rec)
+        docs = _to_documents(rec, min_clinical_score=min_clinical_score)
         documents.extend(docs)
 
     avg_tok = sum(len(d.text) // 4 for d in documents) / max(1, len(documents))
     print(f"  Chunks originales      : {original_chunks}")
     print(f"  Omitidos (texto corto) : {skipped_short}")
-    print(f"  Omitidos (score<{MIN_CLINICAL_SCORE})   : {skipped_score}")
+    print(f"  Omitidos (score<{min_clinical_score})   : {skipped_score}")
     print(f"  Sub-chunks tras split  : {len(documents)}")
     print(f"  Promedio tokens/chunk  : {avg_tok:.0f} tok")
 
@@ -300,6 +316,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Solo mostrar estadisticas, sin modificar el indice",
     )
+    parser.add_argument(
+        "--min-clinical-score",
+        type=int,
+        default=MIN_CLINICAL_SCORE,
+        help=(
+            f"Umbral de clinical_score para incluir un chunk (default {MIN_CLINICAL_SCORE}). "
+            "Bajarlo a 8 recupera los 90 pares del golden set de evaluacion cuyo chunk-oro "
+            "hoy queda fuera del indice — ver retrieval_eval.py y foragents/qa_technical.md."
+        ),
+    )
     args = parser.parse_args()
 
-    ingest(include_test=not args.exclude_test, dry_run=args.dry_run)
+    ingest(
+        include_test=not args.exclude_test,
+        dry_run=args.dry_run,
+        min_clinical_score=args.min_clinical_score,
+    )

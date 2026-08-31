@@ -38,6 +38,19 @@ class Settings(BaseSettings):
     # --- RAG ---
     rag_top_k: int = Field(5, env="RAG_TOP_K")
 
+    # --- RAG: fusión híbrida denso + BM25 (Config F) ---
+    # Ver src/rag/retriever_configF.py y foragents/retrieval_arquitecturas_configs.md.
+    # "rrf" (Reciprocal Rank Fusion, default): robusto porque no depende de
+    # que los scores de FAISS-IP y BM25 sean comparables en escala.
+    # "weighted": fusión min-max ponderada — dio mejor MRR en la medición
+    # offline pero es más sensible al ruido de scores extremos.
+    rag_fusion_strategy: str = Field("rrf", env="RAG_FUSION_STRATEGY")
+    rag_fusion_rrf_k: int = Field(10, env="RAG_FUSION_RRF_K")
+    rag_fusion_dense_weight: float = Field(0.5, env="RAG_FUSION_DENSE_WEIGHT")
+    # Candidatos por lado antes de fusionar (no el k final devuelto al LLM).
+    rag_dense_pool: int = Field(20, env="RAG_DENSE_POOL")
+    rag_bm25_pool: int = Field(20, env="RAG_BM25_POOL")
+
     # --- Panel de administración ---
     # Token compartido que protege todos los endpoints /documents* y /admin*.
     # Si queda vacío, el panel se deshabilita por completo (fail-closed):

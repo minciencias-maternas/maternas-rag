@@ -4,11 +4,31 @@
 > **Convocatoria:** 890 Minciencias · Institución Universitaria de Envigado  
 > **Última actualización:** Agosto 2026
 
-> ⚠️ **Nota de actualización:** `textbook` y `multiclinsum_*` fueron
+> ⚠️ **Nota de actualización (28-ago-2026):** BM25 volvió — no sobre Multiclinsum
+> (que sigue removido por licencia), sino sobre `maternaqaes_lm`+`upload` (~5.400
+> frags en español). **Config F** (denso+BM25, fusión RRF) reemplaza a Config D en
+> producción — ver `src/rag/retriever_configF.py`. Medido sin juez LLM sobre 328
+> pares (`src/evaluation/retrieval_eval.py`): Recall@5 sube de 0.838 (denso) a 0.915
+> (híbrido). Además, `ingest_maternaqaes_lm.py --min-clinical-score 8` (antes 15)
+> llevó la alcanzabilidad del golden set de evaluación de 72.6% a 100%. Índice:
+> 253,469 → 255,625 vectores.
+>
+> **Confirmado con Ragas (cadena completa, n=39, mismo generador `gpt-oss-120b` y
+> juez Cerebras `gemma-4-31b` que la corrida anterior):** `faithfulness` 0.3915 →
+> 0.6173, `answer_correctness` 0.6362 → 0.7876, `answer_relevancy` 0.8101 → 0.9396,
+> `context_recall` 0.4222 → 0.6368, `context_precision` 0.3359 → 0.5608 — las 5
+> métricas mejoran a la vez. Reporte:
+> `evaluation_reports/eval_report_configF_20260828_173548.md`.
+>
+> Detalle en `foragents/qa_technical.md` Q35, que también documenta un data
+> leakage estructural preexistente entre el split `test` del corpus LM y el golden
+> set de evaluación — léase antes de citar estas cifras como comparación directa
+> contra el baseline publicado de MaternaQA-es.
+>
+> ⚠️ **Nota anterior (13-ago-2026):** `textbook` y `multiclinsum_*` fueron
 > removidos del índice FAISS por riesgo de licencia (ver `foragents/qa_technical.md`
-> Q28/Q31). `src/rag/bm25_index.py` fue eliminado (ya no hay BM25 en producción —
-> el retrieval es 100% denso FAISS). La config activa en producción es **Config D**
-> (`medmcqa` + `medqa_*` + `maternaqaes_lm`, 253,455 vectores).
+> Q28/Q31). La config de producción de ese momento era Config D (denso puro,
+> 253,455 vectores) — superada por Config F, arriba.
 >
 > **Segunda nota:** desde la nota anterior se agregó un **panel de
 > administración completo** (Dashboard, Documentos, Métricas, Configuración,
@@ -166,7 +186,7 @@ flowchart TD
         IC["Intent Classifier<br/>Groq · settings.groq_model"]
         RD["Risk Detector<br/>heurística + LLM"]
         CLR{"¿Necesita<br/>clarificación?"}
-        RTR["Retriever<br/>FAISS denso — Config D"]
+        RTR["Retriever<br/>FAISS denso + BM25 — Config F"]
         LLM["LLM Generador<br/>Groq"]
         CITE["citations.py<br/>nombre de documento + bloque Fuentes:"]
         NTFY["Notifier Skill<br/>SMTP — hilo paralelo en /chat/stream"]
@@ -181,7 +201,7 @@ flowchart TD
     RTR --> LLM --> CITE --> RESP(["ChatResponse (JSON)<br/>o eventos NDJSON"])
 
     subgraph STORE["Índice FAISS — faiss_store/"]
-        FAISS_IDX["IndexFlatIP<br/>253 455 vectores · 768 dims<br/>medmcqa + medqa_* + maternaqaes_lm"]
+        FAISS_IDX["IndexFlatIP<br/>255 625 vectores · 768 dims<br/>medmcqa + medqa_* + maternaqaes_lm"]
         META[metadata.pkl]
     end
 
@@ -219,7 +239,7 @@ flowchart TD
 | **Intent Classifier** | Clasifica la consulta en 12 categorías (zero-shot JSON vía `settings.groq_model`), con fallback heurístico por keywords |
 | **Risk Detector** | Evalúa urgencia clínica en 3 niveles: capa 1 heurística (sin API, 0ms, evalúa solo el mensaje actual), capa 2 LLM si la heurística no detecta nada (sí considera turnos previos, con criterio explícito de aislar mensajes no relacionados) |
 | **risk_episodes.py** | Deduplica notificaciones de riesgo por sesión, en memoria: un turno "low" cierra el episodio; medium/high solo renotifica si el riesgo escala o aparece una categoría de flag distinta a la última efectivamente notificada |
-| **Retriever** | Búsqueda densa FAISS pura sobre `medmcqa` + `medqa_*` + `maternaqaes_lm` (Config D, producción actual; sin BM25, sin `textbook`/`multiclinsum` — removidos por licencia) |
+| **Retriever** | Config F (producción actual): denso FAISS sobre `medmcqa`+`medqa_*`+`maternaqaes_lm`+`upload`, fusionado con BM25 sobre `maternaqaes_lm`+`upload` (fusión RRF). Sin `textbook`/`multiclinsum` — removidos por licencia |
 | **FAISS Store** | Gestiona el índice vectorial en disco: carga, búsqueda, adición de documentos, activación/desactivación, persistencia |
 | **Notifier Skill** | Envía alertas por email SMTP cuando se detecta riesgo alto o medio-alto, con la secuencia completa de mensajes que llevó a la alerta (no solo el mensaje que la disparó) |
 | **usage_sessions.py** | Registro en memoria de sesiones activas (Streamlit/Telegram) por `session_id` aleatorio: duración y tokens consumidos por sesión, sin ningún dato identificable — alimenta la subsección "Uso en tiempo real" de Métricas |
@@ -251,8 +271,10 @@ maternas-rag/
 │   │   ├── risk_episodes.py      # Dedup de notificaciones de riesgo por episodio (en memoria)
 │   │   ├── retriever.py          # Config activa (= configD actualmente — producción)
 │   │   ├── retriever_configA.py  # [histórico] FAISS puro — baseline
-│   │   ├── retriever_configB.py  # [histórico] FAISS+BM25
+│   │   ├── retriever_configB.py  # [histórico] FAISS+BM25 sobre Multiclinsum
 │   │   ├── retriever_configC.py  # [histórico] FAISS+BM25+corpus ES
+│   │   ├── retriever_configD.py  # [histórico] denso puro, sin BM25
+│   │   ├── retriever_configF.py  # [producción] FAISS+BM25 sobre maternaqaes_lm/upload
 │   │   └── retriever_configD.py  # medmcqa+medqa_*+maternaqaes_lm, sin textbook/multiclinsum (licencia)
 │   ├── classifiers/
 │   │   ├── intent_classifier.py  # Clasificación en 12 intents (LLM + heurística)
@@ -625,7 +647,7 @@ graph TD
     subgraph Core["src/rag/"]
         CHAIN["chain.py<br/>Orquestador — chat() / chat_stream()"]
         CITE["citations.py"]
-        RTR["retriever.py<br/>FAISS denso (Config D)"]
+        RTR["retriever.py<br/>FAISS denso + BM25 (Config F)"]
     end
 
     subgraph Classifiers["src/classifiers/"]
@@ -1311,18 +1333,21 @@ python src/bot/maternas_bot.py
 ### Ejecutar la evaluación Ragas
 
 ```bash
-# Paso 1: Activar arquitectura a evaluar
-copy src\rag\retriever_configC.py src\rag\retriever.py   # Windows
-# cp src/rag/retriever_configC.py src/rag/retriever.py   # Linux
+# Paso 1: Activar arquitectura a evaluar (ejemplo: comparar contra Config D)
+copy src\rag\retriever_configD.py src\rag\retriever.py   # Windows
+# cp src/rag/retriever_configD.py src/rag/retriever.py   # Linux
 
 # Paso 2: Generar respuestas (requiere GROQ_API_KEY con cuota disponible)
-python src/evaluation/eval_pipeline.py --config configC --sample 15 --generate-only
+python src/evaluation/eval_pipeline.py --config configD --sample 15 --generate-only
 
 # Paso 3: Evaluar con Ragas (requiere CEREBRAS_KEY, ~40-50 min para 15 pares)
-python src/evaluation/eval_pipeline.py --evaluate-only evaluation_reports/eval_raw_configC_<ts>.json
+python src/evaluation/eval_pipeline.py --evaluate-only evaluation_reports/eval_raw_configD_<ts>.json
 
-# Paso 4: Restaurar Config B a producción
-copy src\rag\retriever_configB.py src\rag\retriever.py
+# Paso 4: Restaurar Config F a producción
+copy src\rag\retriever_configF.py src\rag\retriever.py
+
+# Alternativa recomendada — sin juez LLM, cubre los 328 pares, ~1 min:
+python -m src.evaluation.retrieval_eval --compare dense,bm25,hybrid
 ```
 
 ### Tests
@@ -1361,12 +1386,23 @@ No existe pipeline de CI/CD, Dockerfile ni configuración de despliegue en el re
 | **Chunking ~336 tok** para MaternaQA-es LM | Chunks originales ~879 tok | Faithfulness de 0.133 → 0.359 al re-chunkar. Chunks más cortos permiten al juez Ragas localizar afirmaciones concretas. |
 | **Heurística + LLM en cascada** para riesgo | LLM solo | Heurística: latencia 0ms, determinismo, sin costo de API para casos obvios (hemorragia, convulsión). LLM solo para casos ambiguos. |
 | **Historial de 6 turnos** | Historial completo | Equilibrio entre contexto conversacional y ventana de contexto del LLM. Más de 6 turnos incrementa costo de tokens sin mejora perceptible. |
-| **Sin fine-tuning** | QLoRA, LoRA | Restricción explícita del proyecto. El RAG con corpus especializado compensa la falta de fine-tuning para el dominio. |
+| **Sin fine-tuning de modelos generadores** | QLoRA, LoRA (probados en etapas previas del proyecto) | Límites de infraestructura (requeriría GPU dedicada para entrenamiento e inferencia) y alto costo computacional frente a servir modelos ya entrenados vía API. El RAG con corpus especializado compensa la falta de fine-tuning para el dominio — ver detalle debajo. |
 | **NDJSON sobre `StreamingResponse`** para `/chat/stream` | WebSocket, Server-Sent Events | Un endpoint HTTP normal basta para un stream unidireccional servidor→cliente; NDJSON es trivial de parsear línea por línea en `httpx.iter_lines()`, sin librería de WebSocket en ningún lado del stack. |
 | **Bot de Telegram como subproceso hijo de la API** (`subprocess.Popen`) | systemd/Docker/supervisor externo, IPC en caliente hacia el proceso del bot | El proyecto corre en una sola máquina sin orquestador; un subproceso administrado por la propia API es suficiente para iniciar/detener/reiniciar desde la UI, y evita construir sincronización en caliente entre dos procesos para 4 variables que el bot solo lee al arrancar. |
 | **Campos Pydantic fijos (`extra="forbid"`)** para `PATCH /admin/config`, en vez de un `{key, value}` genérico | Endpoint genérico de key/value | Un endpoint que escribe en `.env` es superficie de inyección de configuración; con campos fijos no existe forma de pedirle que toque una variable fuera de la lista declarada (p. ej. `ADMIN_API_TOKEN`) — un campo desconocido es `422`, nunca se aplica ni se ignora en silencio. |
 | **`session_id` aleatorio (uuid4) generado por el cliente**, nunca derivado de un chat_id de Telegram real | Reusar el hash SHA-256 de `chat_id` que ya existe en `maternas_bot.py`; no trackear sesiones en absoluto | Un hash de `chat_id`, aunque no revele la identidad, sigue siendo un identificador *estable*: correlacionaría todas las sesiones de la misma persona a lo largo del tiempo en la vista de métricas, algo que el requerimiento explícitamente pedía evitar ("no se debe poder diferenciar un usuario de otro"). Un uuid4 nuevo por sesión no permite esa correlación. |
 | **Deduplicación de notificaciones de riesgo en memoria (`risk_episodes.py`), guardando solo nivel+flags** | Persistir el episodio (como `active_users.json`, cifrado en disco); no deduplicar y notificar en cada turno | El proyecto ya había decidido (Q en `qa_technical.md`) no persistir banderas clínicas descriptivas ni siquiera cifradas — extender esa misma postura a un registro nuevo fue más simple que justificar una excepción. Notificar en cada turno fue directamente el bug reportado por el usuario a corregir. |
+
+### Sin fine-tuning de modelos generadores
+
+Este proyecto **no utiliza modelos LLM generadores fine-tuneados**. Los modelos de generación de respuesta (`gpt-oss-120b` vía Groq, `gemma-4-31b` vía Cerebras para el juez de evaluación) se usan **tal cual los sirve el proveedor**, mediante prompting (system prompt + few-shot cuando aplica) y RAG, sin ajuste de pesos.
+
+Durante etapas previas del desarrollo del proyecto sí se realizaron pruebas de fine-tuning sobre algunos LLMs. Se decidió **no incorporar esa vía en la versión actual** por dos motivos:
+
+- **Infraestructura:** fine-tunear y luego servir un modelo propio requiere GPU dedicada (entrenamiento e inferencia), lo que excede la infraestructura disponible para este proyecto.
+- **Costo computacional:** el consumo de cómputo de entrenar y mantener un modelo fine-tuneado es significativamente mayor que el de consumir modelos ya entrenados vía API, sin una ganancia de calidad que lo justifique frente al enfoque RAG (retrieval + prompting) usado aquí.
+
+El diseño actual delega la especialización de dominio al **retrieval** (corpus obstétrico + fusión híbrida BM25/denso, ver §10 y Config F en `foragents/retrieval_arquitecturas_configs.md`) en vez de al ajuste de pesos del modelo generador. Esto mantiene el sistema reproducible y operable sin infraestructura de entrenamiento propia. Ver también `foragents/qa_technical.md` Q36.
 
 ---
 
