@@ -4,11 +4,32 @@
 > **Convocatoria:** 890 Minciencias · Institución Universitaria de Envigado  
 > **Última actualización:** Agosto 2026
 
-> ⚠️ **Nota de actualización:** `textbook` y `multiclinsum_*` fueron
+> ⚠️ **Nota de actualización (28-ago-2026):** BM25 volvió — no sobre Multiclinsum
+> (que sigue removido por licencia), sino sobre `maternaqaes_lm`+`upload` (~5.400
+> frags en español). **Config F** (denso+BM25, fusión RRF) reemplaza a Config D en
+> producción — ver `src/rag/retriever_configF.py`. Medido sin juez LLM sobre 328
+> pares (`src/evaluation/retrieval_eval.py`): Recall@5 sube de 0.838 (denso) a 0.915
+> (híbrido). Además, `ingest_maternaqaes_lm.py --min-clinical-score 8` (antes 15)
+> llevó la alcanzabilidad del golden set de evaluación de 72.6% a 100%. Índice:
+> 253,469 → 255,625 vectores.
+>
+> **Confirmado con Ragas (cadena completa, n=39, mismo generador `gpt-oss-120b` y
+> juez Cerebras `gemma-4-31b` que la corrida anterior):** `faithfulness` 0.3915 →
+> 0.6173, `answer_correctness` 0.6362 → 0.7876, `answer_relevancy` 0.8101 → 0.9396,
+> `context_recall` 0.4222 → 0.6368, `context_precision` 0.3359 → 0.5608 — las 5
+> métricas mejoran a la vez. Reporte:
+> `evaluation_reports/eval_report_configF_20260828_173548.md`.
+>
+> Detalle en `foragents/qa_technical.md` Q35, que también documenta un data
+> leakage estructural preexistente entre el split `test` del corpus LM y el golden
+> set de evaluación — léase antes de citar estas cifras como comparación directa
+> contra el baseline publicado de MaternaQA-es. Commiteado el 31-ago-2026 en
+> `2b1e4c6`.
+>
+> ⚠️ **Nota anterior (13-ago-2026):** `textbook` y `multiclinsum_*` fueron
 > removidos del índice FAISS por riesgo de licencia (ver `foragents/qa_technical.md`
-> Q28/Q31). `src/rag/bm25_index.py` fue eliminado (ya no hay BM25 en producción —
-> el retrieval es 100% denso FAISS). La config activa en producción es **Config D**
-> (`medmcqa` + `medqa_*` + `maternaqaes_lm`, 253,455 vectores).
+> Q28/Q31). La config de producción de ese momento era Config D (denso puro,
+> 253,455 vectores) — superada por Config F, arriba.
 >
 > **Segunda nota:** desde la nota anterior se agregó un **panel de
 > administración completo** (Dashboard, Documentos, Métricas, Configuración,
@@ -23,6 +44,31 @@
 > `intent_classifier.py`, `risk_detector.py`) leen `settings.groq_model`, sin
 > valores hardcodeados. El proyecto también tiene ahora una suite de tests
 > automatizados (`pytest`, `tests/`) — ver sección 14.
+>
+> **Tercera nota (24-ago-2026):** dos cambios sobre lo anterior. (1) La
+> página **Métricas** del panel admin suma una subsección **"Uso en tiempo
+> real"**: cuenta sesiones activas de Streamlit/Telegram con su duración y
+> tokens consumidos, **sin ningún identificador de sesión ni de usuario** —
+> ver `GET /admin/usage_sessions` y `src/api/usage_sessions.py`. (2) Se
+> corrigió la notificación de riesgo clínico: la capa heurística y el prompt
+> del LLM "contaminaban" turnos posteriores no relacionados con keywords de
+> alarma de varios mensajes atrás, reenviando el correo en cada turno
+> siguiente; ahora un nuevo módulo `src/rag/risk_episodes.py` deduplica por
+> episodio (nivel + categorías de flags, nunca texto clínico, en memoria) y
+> el email de alerta incluye la **secuencia completa** de mensajes que llevó
+> a la alerta, no solo el que la disparó. Ambos cambios reutilizan el mismo
+> `session_id` aleatorio (uuid4, generado por el cliente — nunca derivado de
+> un chat_id de Telegram real) que ahora viaja en `POST /chat`/`/chat/stream`.
+> Detalle en la sección **6** (Uso en tiempo real) y la nueva sección **9.5**
+> (Deduplicación de notificaciones de riesgo).
+>
+> **Cuarta nota (24-ago-2026):** se agregó una segunda capa de aceptación,
+> secuencial a la del aviso de tratamiento de datos: **Términos y
+> Condiciones de uso** (`TERMS_TEXT` en `src/consent.py`), marcada
+> explícitamente como **BORRADOR — PENDIENTE DE REVISIÓN LEGAL**. Ninguna
+> sesión (Streamlit o Telegram) puede chatear sin aceptar ambas capas en
+> orden; rechazar cualquiera de las dos termina la sesión. Detalle completo
+> en la nueva sección **1.5**.
 
 ---
 
@@ -54,6 +100,56 @@ La arquitectura está diseñada para operar con costo marginal cercano a cero (A
 
 ---
 
+## 1.5 Tratamiento de Datos y Términos y Condiciones
+
+Antes de que una sesión nueva (Streamlit o Telegram) pueda enviar **cualquier** mensaje, debe aceptar **dos capas secuenciales**, en este orden. Ambas viven en `src/consent.py` — fuente única compartida por la UI y el bot, texto en plano (sin markdown) para que se renderice igual en las dos plataformas.
+
+```mermaid
+sequenceDiagram
+    actor U as Usuario
+    participant GATE as consent_gate.py (Streamlit)<br/>o maternas_bot.py (Telegram)
+
+    U->>GATE: primer mensaje de la sesión
+    GATE->>U: Capa 1 — CONSENT_TEXT<br/>(tratamiento de datos)
+    alt Rechaza
+        GATE->>U: FAREWELL_TEXT — sesión terminada
+        Note over GATE: próximo mensaje vuelve a mostrar la Capa 1
+    else Acepta
+        GATE->>U: Capa 2 — TERMS_TEXT<br/>(Términos y Condiciones, BORRADOR)
+        alt Rechaza
+            GATE->>U: FAREWELL_TEXT — sesión terminada
+            Note over GATE: próximo mensaje vuelve a mostrar la Capa 1
+        else Acepta
+            GATE->>U: Chat habilitado
+        end
+    end
+```
+
+### Capa 1 — Aviso de tratamiento de información (`CONSENT_TEXT`)
+
+Explica, en lenguaje llano: que el proyecto está en fase experimental y no sustituye a un profesional; qué datos se conservan (alias + código interno, nunca nombre legal/documento/dirección/contraseñas); que la conversación se procesa para dar contexto al diálogo y a los fines de investigación, con anonimización/seudonimización si se usa en publicaciones; que la participación es voluntaria y el retiro de información se puede solicitar en cualquier momento; y una advertencia explícita de que es un prototipo, "aún no apto para uso clínico, comercial o productivo real".
+
+### Capa 2 — Términos y Condiciones de uso (`TERMS_TEXT`) — **BORRADOR**
+
+Se muestra **únicamente después de aceptar la Capa 1**, nunca antes ni en paralelo. A diferencia de la Capa 1 (ya estable), este texto está encabezado explícitamente como **"BORRADOR — PENDIENTE DE REVISIÓN LEGAL"**: es una especificación funcional razonable (naturaleza del proyecto, ausencia de garantías, límite de responsabilidad, uso aceptable, propiedad del contenido generado, posibilidad de cambios), no un documento legal definitivo. No debe activarse en un despliegue productivo sin la revisión y aprobación de las instancias jurídicas y éticas correspondientes — mismo requisito que ya exige el README en su sección **"Advertencia de uso y puesta en producción"** (ver más abajo).
+
+### Mecánica de aceptación/rechazo
+
+| Plataforma | Implementación | Estado por sesión |
+|---|---|---|
+| **Streamlit** | `src/ui/consent_gate.py` — dos `st.dialog()` secuenciales, `enforce_consent()` bloquea con `st.stop()` hasta que ambas capas estén `"accepted"` | `st.session_state.consent_status` / `.terms_status` — se pierde en cada sesión de navegador nueva (incluye un refresh duro) |
+| **Telegram** | `src/bot/maternas_bot.py` — dos mensajes con `InlineKeyboardMarkup` secuenciales (`consent_callback` → `terms_callback`), `handle_message()`/`handle_non_text()` verifican ambas antes de procesar cualquier turno | `consent_status` / `terms_status` — dicts en memoria por `hash(user_id)`, `_end_session()` centraliza la limpieza compartida al rechazar |
+
+**Rechazar cualquiera de las dos capas termina la sesión por completo** (no solo esa capa): se limpia el historial conversacional, se da de baja del scheduler de riesgo (`active_users.py`) y se cierra la sesión de métricas de uso (`usage_sessions.py`, ver sección 6). El próximo mensaje del usuario vuelve a mostrar la Capa 1 desde cero — nunca reanuda a mitad de camino con una sola capa aceptada de una sesión anterior.
+
+`/start` y `/reset` en Telegram fuerzan la re-aceptación de ambas capas aunque ya se hubieran aceptado antes, tratando el comando como el inicio de una sesión nueva.
+
+### Advertencia de uso y puesta en producción
+
+El **README** (sección homónima) es la fuente autoritativa de esta advertencia — se resume acá para que quede enlazada desde el flujo de consentimiento: *"Este software corresponde a un prototipo desarrollado con fines de investigación (...) no implica que se encuentre autorizado para operar como servicio productivo, comercial, clínico, psicológico, educativo o institucional."* El README enumera además una checklist mínima de 10 puntos que la organización responsable debe cubrir antes de producción (política de tratamiento de datos, aviso de privacidad, evaluación de impacto en privacidad, revisión jurídica y ética, entre otros) — la Capa 2 (T&C) de esta sección es un primer borrador funcional hacia ese requisito, no un sustituto de él.
+
+---
+
 ## 2. Arquitectura General
 
 ### Diagrama de alto nivel
@@ -79,29 +175,34 @@ flowchart TD
             EP_BOTR["/admin/bot/*"]
             EP_LOGS["/admin/logs"]
             EP_EVAL["/admin/evaluations*"]
+            EP_USAGE["/admin/usage_sessions"]
         end
     end
 
     EP_CHAT --> CHAIN["chain.py — Orquestador<br/>chat() · chat_stream()"]
+    EP_CHAT -->|session_id, platform| USAGE["usage_sessions.py<br/>sesiones activas (en memoria)"]
+    EP_USAGE -.->|lee, anonimizado| USAGE
 
     subgraph CHAIN_FLOW["Flujo por turno"]
         IC["Intent Classifier<br/>Groq · settings.groq_model"]
         RD["Risk Detector<br/>heurística + LLM"]
         CLR{"¿Necesita<br/>clarificación?"}
-        RTR["Retriever<br/>FAISS denso — Config D"]
+        RTR["Retriever<br/>FAISS denso + BM25 — Config F"]
         LLM["LLM Generador<br/>Groq"]
         CITE["citations.py<br/>nombre de documento + bloque Fuentes:"]
         NTFY["Notifier Skill<br/>SMTP — hilo paralelo en /chat/stream"]
+        EPISODE["risk_episodes.py<br/>dedup por episodio (en memoria)"]
     end
 
     CHAIN --> IC --> RD --> CLR
     CLR -->|Sí| RESP_CLR([Pregunta de clarificación])
     CLR -->|No| RTR
-    RD -->|risk=high/medium| NTFY
+    RD -->|risk=high/medium| EPISODE
+    EPISODE -->|señal nueva| NTFY
     RTR --> LLM --> CITE --> RESP(["ChatResponse (JSON)<br/>o eventos NDJSON"])
 
     subgraph STORE["Índice FAISS — faiss_store/"]
-        FAISS_IDX["IndexFlatIP<br/>253 455 vectores · 768 dims<br/>medmcqa + medqa_* + maternaqaes_lm"]
+        FAISS_IDX["IndexFlatIP<br/>255 625 vectores · 768 dims<br/>medmcqa + medqa_* + maternaqaes_lm"]
         META[metadata.pkl]
     end
 
@@ -125,7 +226,7 @@ flowchart TD
     EP_EVAL -.->|lee, no recalcula| REPORT
 ```
 
-> El bot de Telegram consume `POST /chat` (no streaming); solo la UI Streamlit usa `POST /chat/stream`. `EP_DOCS`/`EP_CFG`/`EP_BOTR`/`EP_LOGS`/`EP_EVAL` están detallados en la sección **6 — Panel de Administración**.
+> El bot de Telegram consume `POST /chat` (no streaming); solo la UI Streamlit usa `POST /chat/stream`. `EP_DOCS`/`EP_CFG`/`EP_BOTR`/`EP_LOGS`/`EP_EVAL`/`EP_USAGE` están detallados en la sección **6 — Panel de Administración**.
 
 ### Descripción de componentes
 
@@ -134,13 +235,15 @@ flowchart TD
 | **Bot Telegram** | Cliente ligero: reenvía mensajes a `POST /chat`, mantiene historial en RAM por usuario, formatea respuestas con badges de riesgo HTML, corre el scheduler de check-ins vía `JobQueue` |
 | **UI Streamlit** | Interfaz web multipágina: Chat (público) + Dashboard/Documentos/Métricas/Configuración/Consola (solo admin, gate por `X-Admin-Token`) |
 | **FastAPI** | Punto de entrada REST: valida requests con Pydantic, carga FAISS en startup vía `lifespan`, expone endpoints públicos (`/chat`, `/chat/stream`, `/classify`, `/health`) y administrativos (`/documents*`, `/admin*`, protegidos) |
-| **chain.py** | Orquestador del turno: intent → risk → clarification check → notificación (paralela en streaming) → retrieval → generación → citas. Expone `chat()` y `chat_stream()` sobre la misma lógica compartida |
+| **chain.py** | Orquestador del turno: intent → risk → clarification check → dedup de episodio + notificación (paralela en streaming) → retrieval → generación → citas. Expone `chat()` y `chat_stream()` sobre la misma lógica compartida, ambos con `session_id` opcional |
 | **citations.py** | Nombre legible del documento de origen de cada fragmento citado (`[n]` → bloque `Fuentes:`), en vez de "fragmento [n]" genérico |
 | **Intent Classifier** | Clasifica la consulta en 12 categorías (zero-shot JSON vía `settings.groq_model`), con fallback heurístico por keywords |
-| **Risk Detector** | Evalúa urgencia clínica en 3 niveles: capa 1 heurística (sin API, 0ms), capa 2 LLM si la heurística no detecta nada |
-| **Retriever** | Búsqueda densa FAISS pura sobre `medmcqa` + `medqa_*` + `maternaqaes_lm` (Config D, producción actual; sin BM25, sin `textbook`/`multiclinsum` — removidos por licencia) |
+| **Risk Detector** | Evalúa urgencia clínica en 3 niveles: capa 1 heurística (sin API, 0ms, evalúa solo el mensaje actual), capa 2 LLM si la heurística no detecta nada (sí considera turnos previos, con criterio explícito de aislar mensajes no relacionados) |
+| **risk_episodes.py** | Deduplica notificaciones de riesgo por sesión, en memoria: un turno "low" cierra el episodio; medium/high solo renotifica si el riesgo escala o aparece una categoría de flag distinta a la última efectivamente notificada |
+| **Retriever** | Config F (producción actual): denso FAISS sobre `medmcqa`+`medqa_*`+`maternaqaes_lm`+`upload`, fusionado con BM25 sobre `maternaqaes_lm`+`upload` (fusión RRF). Sin `textbook`/`multiclinsum` — removidos por licencia |
 | **FAISS Store** | Gestiona el índice vectorial en disco: carga, búsqueda, adición de documentos, activación/desactivación, persistencia |
-| **Notifier Skill** | Envía alertas por email SMTP cuando se detecta riesgo alto o medio-alto |
+| **Notifier Skill** | Envía alertas por email SMTP cuando se detecta riesgo alto o medio-alto, con la secuencia completa de mensajes que llevó a la alerta (no solo el mensaje que la disparó) |
+| **usage_sessions.py** | Registro en memoria de sesiones activas (Streamlit/Telegram) por `session_id` aleatorio: duración y tokens consumidos por sesión, sin ningún dato identificable — alimenta la subsección "Uso en tiempo real" de Métricas |
 | **routes_documents.py / routes_admin.py / routes_bot.py** | Endpoints del panel: gestión de documentos, evaluaciones + configuración editable + logs, y control del bot, cada uno protegido por `require_admin_token` a nivel de router |
 | **bot_supervisor.py** | Arranca/detiene/reinicia `maternas_bot.py` como subproceso hijo de la API; expone estado (pid, uptime, `crashed`) y buffer de logs en memoria |
 | **eval_pipeline.py** | Pipeline de evaluación en dos fases con modelos independientes; calcula 5 métricas Ragas + latencia |
@@ -153,22 +256,28 @@ flowchart TD
 maternas-rag/
 ├── src/                          # Código fuente principal
 │   ├── settings.py               # Configuración central (Pydantic Settings, lee .env)
+│   ├── consent.py                # Textos de las 2 capas (datos + T&C), compartidos UI/bot — ver sección 1.5
 │   ├── api/
 │   │   ├── main.py               # FastAPI app: lifespan, /chat, /chat/stream, /classify, /health
 │   │   ├── schemas.py            # Modelos Pydantic de request/response
 │   │   ├── auth.py               # require_admin_token(): valida X-Admin-Token (fail-closed)
 │   │   ├── routes_documents.py   # /documents* — gestión en vivo del índice FAISS
-│   │   ├── routes_admin.py       # /admin/evaluations*, /admin/config (GET+PATCH), /admin/logs
+│   │   ├── routes_admin.py       # /admin/evaluations*, /admin/config (GET+PATCH), /admin/logs, /admin/usage_sessions
 │   │   ├── routes_bot.py         # /admin/bot/* — mapeo HTTP de bot_supervisor.py
-│   │   └── bot_supervisor.py     # Arranca/detiene maternas_bot.py como subproceso hijo
+│   │   ├── bot_supervisor.py     # Arranca/detiene maternas_bot.py como subproceso hijo
+│   │   └── usage_sessions.py     # Sesiones activas en memoria (Streamlit/Telegram), anonimizado
 │   ├── rag/
 │   │   ├── chain.py              # Orquestador principal del turno RAG (chat() + chat_stream())
 │   │   ├── citations.py          # Nombre legible de fuentes citadas ([n] → "Fuentes:")
-│   │   ├── retriever.py          # Config activa (= configD actualmente — producción)
+│   │   ├── risk_episodes.py      # Dedup de notificaciones de riesgo por episodio (en memoria)
+│   │   ├── retriever.py          # Config activa (= configF actualmente — producción, híbrido)
+│   │   ├── bm25_index.py         # Índice léxico BM25 (singleton, reutiliza metadata de FAISSStore)
 │   │   ├── retriever_configA.py  # [histórico] FAISS puro — baseline
-│   │   ├── retriever_configB.py  # [histórico] FAISS+BM25
+│   │   ├── retriever_configB.py  # [histórico] FAISS+BM25 sobre Multiclinsum
 │   │   ├── retriever_configC.py  # [histórico] FAISS+BM25+corpus ES
-│   │   └── retriever_configD.py  # medmcqa+medqa_*+maternaqaes_lm, sin textbook/multiclinsum (licencia)
+│   │   ├── retriever_configD.py  # [histórico] denso puro, medmcqa+medqa_*+maternaqaes_lm, sin BM25 ni textbook/multiclinsum (licencia)
+│   │   ├── retriever_configE.py  # [histórico, descartado] Config D + HyDE
+│   │   └── retriever_configF.py  # [producción] híbrido: FAISS denso + BM25 sobre maternaqaes_lm/upload, fusión RRF
 │   ├── classifiers/
 │   │   ├── intent_classifier.py  # Clasificación en 12 intents (LLM + heurística)
 │   │   └── risk_detector.py      # Detección de riesgo en 3 niveles (reglas + LLM)
@@ -184,6 +293,7 @@ maternas-rag/
 │   │   └── run_ingestion.py      # Orquestador: corre todos los scripts
 │   ├── evaluation/
 │   │   ├── eval_pipeline.py      # Pipeline 2 fases: generación + Ragas
+│   │   ├── retrieval_eval.py     # Harness determinista (sin juez LLM): Recall@k/MRR/nDCG sobre el golden set
 │   │   └── sampler.py            # Muestreo estratificado de MaternaQA-es
 │   ├── bot/
 │   │   ├── maternas_bot.py       # Bot Telegram (polling)
@@ -192,7 +302,7 @@ maternas-rag/
 │   │   ├── app.py                # Entrypoint Streamlit: gates, sidebar, st.navigation
 │   │   ├── client.py             # Cliente HTTP hacia la API (sin lógica de presentación)
 │   │   ├── admin_gate.py         # Desbloquea las páginas admin dentro de la sesión (X-Admin-Token)
-│   │   ├── consent_gate.py       # Exige el aviso de tratamiento de datos antes de usar cualquier página
+│   │   ├── consent_gate.py       # Exige las 2 capas (datos + T&C) antes de usar cualquier página
 │   │   └── views/                # chat, dashboard, documents, metrics, config, console
 │   └── skills/
 │       ├── __init__.py           # ToolSpec, ToolRegistry, Skill base
@@ -200,15 +310,20 @@ maternas-rag/
 │           ├── skill.py          # NotifierSkill con ToolSpec
 │           └── tool.py           # notify_risk(): envío SMTP
 ├── docs/                         # Documentación técnica e informes
-│   └── DOCUMENTACION.md
+│   ├── DOCUMENTACION_oss120b_20260831.md  # este documento
+│   └── informe_metricas.docx
 ├── foragents/                    # Contexto técnico para agentes IA
 │   ├── technical_plan.md         # Plan técnico completo aprobado
-│   ├── qa_technical.md           # 27 preguntas técnicas resueltas
+│   ├── qa_technical.md           # 36 preguntas técnicas resueltas
 │   ├── eval_runbook.md           # Guía operacional de evaluación
 │   ├── eval_setup_critico.md     # Setup crítico del pipeline de evaluación
 │   ├── retrieval_arquitecturas_configs.md
 │   ├── project_constraints.md
 │   └── test_cases.md
+├── tests/                        # Suite pytest (307/307 al commit 2b1e4c6)
+│   ├── test_bm25_index.py        # Índice léxico BM25: tokenizador, active, mutation_seq
+│   ├── test_retriever_fusion.py  # Fusión RRF/ponderada, deduplicación, retrieve()
+│   └── ...                       # clasificadores, gestión de documentos, config, citas, streaming
 ├── evaluation_reports/           # Resultados de evaluación (gitignored)
 ├── faiss_store/                  # Índice FAISS compilado (gitignored)
 ├── datasets/                     # Datasets crudos (gitignored)
@@ -246,9 +361,9 @@ El proyecto consume datasets de repositorios públicos de GitHub. Se accede a el
 
 ### Importancia para el proyecto
 
-El corpus **MaternaQA-es LM** (5 353 sub-chunks tras re-chunking) es el único dataset en español específico de obstetricia colombiana en el índice. Su incorporación incrementó `context_recall` de 0.000 a 0.452 y `faithfulness` de 0.228 a 0.456 al comparar Config B vs Config C v3. Sin este corpus, el sistema responde desde conocimiento médico general en inglés.
+El corpus **MaternaQA-es LM** (7 509 sub-chunks tras re-chunking y la re-ingesta con `--min-clinical-score 8`, sección 11) es el único dataset en español específico de obstetricia colombiana en el índice. Su incorporación incrementó `context_recall` de 0.000 a 0.452 y `faithfulness` de 0.228 a 0.456 al comparar Config B vs Config C v3. Sin este corpus, el sistema responde desde conocimiento médico general en inglés.
 
-El split `test.jsonl` del benchmark (328 pares QA) se usa exclusivamente para evaluación: no se ingesta al índice en condiciones normales para evitar data leakage. Los 3 PDFs fuente del benchmark (`GPC-Atencion-Prenatal-de-Bajo-Riesgo-2023.pdf`, `vol831-1.pdf`, `4142_stamped.pdf`) están representados solo a través de sus fragmentos JSONL pre-procesados.
+> **Corrección (31-ago-2026):** el párrafo original afirmaba que el split `test.jsonl` del benchmark "no se ingesta al índice en condiciones normales para evitar data leakage". Eso es **incorrecto** — `ingest_maternaqaes_lm.py` incluye el split `test` por defecto (`include_test=True`) desde antes de este informe, y los 3 PDFs fuente del benchmark (`GPC-Atencion-Prenatal-de-Bajo-Riesgo-2023.pdf`, `vol831-1.pdf`, `4142_stamped.pdf`) sí están indexados — son exactamente los mismos de los que sale el golden set completo de evaluación. Es un data leakage estructural preexistente (no introducido por Config F), presente en **todos** los reportes `eval_report_config{A..F}_*.md` publicados: miden honestamente "¿el sistema desplegado encuentra el pasaje correcto?", pero no generalización a documentos nunca vistos. `--exclude-test` existe en el script para el caso sin leakage, pero nunca se ha usado en producción. Detalle en `foragents/qa_technical.md` Q35.
 
 ---
 
@@ -343,7 +458,7 @@ El panel de administración vive dentro de la misma app de Streamlit (`src/ui/ap
 |---|---|---|
 | **Dashboard** | Resumen de sesión: estado de la API, vectores indexados, mensajes de la sesión actual | Ninguna (lee `st.session_state`) |
 | **Documentos** | Centro de gestión documental: listar/buscar, ver detalle paginado de fragmentos, activar/desactivar, subir `.txt` nuevo | `/documents*` |
-| **Métricas** | Visor de corridas de evaluación Ragas ya generadas (no recomputa nada) | `/admin/evaluations*` |
+| **Métricas** | Visor de corridas de evaluación Ragas ya generadas (no recomputa nada) + subsección "Uso en tiempo real" (sesiones activas anonimizadas) | `/admin/evaluations*`, `/admin/usage_sessions` |
 | **Configuración** | Config efectiva del backend (solo lectura) + formulario editable para 10 variables de `.env` | `/admin/config` (GET+PATCH) |
 | **Consola** | Estado/logs de la API y del bot de Telegram, con control de arranque del bot | `/admin/logs`, `/admin/bot/*` |
 
@@ -404,6 +519,18 @@ Decisiones relevantes:
 
 Solo lectura: lee los reportes JSON que `src/evaluation/eval_pipeline.py` ya generó en `evaluation_reports/`, sin recomputar nada. `run_id` se resuelve contra una ruta validada dentro de `evaluation_reports/` (rechaza intentos de path traversal tipo `../../secrets`).
 
+### Uso en tiempo real (`/admin/usage_sessions`, `src/api/usage_sessions.py`)
+
+Subsección nueva de **Métricas**: dos tarjetas KPI (sesiones activas en Streamlit / Telegram) + una tabla por plataforma con **Duración activa** y **Tokens usados** por sesión.
+
+**Cómo se identifica una sesión, sin identificar a la persona:** el cliente (Streamlit o el bot de Telegram) genera un `session_id` aleatorio (`uuid4`) — **nunca derivado del `chat_id` real de Telegram ni de ningún dato identificable** — y lo manda en el campo `session_id` de `POST /chat`/`POST /chat/stream`. El backend lo usa solo como clave de un dict en memoria (`{platform, started_at, last_activity, tokens_total}`); una sesión sin turnos nuevos en 15 minutos deja de contarse como activa. `GET /admin/usage_sessions` devuelve la vista ya anonimizada: **nunca el `session_id`, ni un hash, ni ningún derivado de él** — solo `platform`, `active_seconds` y `tokens_total` por fila, sin ninguna columna ni orden estable entre refrescos que pudiera actuar como identificador. Igual que `histories` en el bot de Telegram, es puramente en memoria: se pierde al reiniciar la API — suficiente para una vista de monitoreo en vivo, no una métrica histórica.
+
+**Streamlit:** el `session_id` se genera una vez por sesión de navegador (`st.session_state.session_id` en `app.py`). Un refresh duro del navegador crea una sesión de Streamlit nueva desde cero, así que también genera un `session_id` nuevo — limitación conocida, no solucionable sin cookies/localStorage (ver sección 17).
+
+**Telegram:** el `session_id` se genera por conversación y se regenera en `/start` y `/reset` — la sesión de uso anterior deja de recibir turnos y expira sola por inactividad, sin necesidad de una señal explícita de "fin de sesión" hacia el backend.
+
+Este mismo `session_id` también alimenta la deduplicación de notificaciones de riesgo por episodio — ver sección **9.5**.
+
 ### Configuración editable (`/admin/config`, `src/api/routes_admin.py`)
 
 10 variables de `.env` se pueden editar desde la página **Configuración**, sin editar el archivo a mano ni reiniciar procesos por terminal:
@@ -452,9 +579,9 @@ sequenceDiagram
     participant E as Fase 2 (Ragas Judge)
     participant R as eval_results_*.json
 
-    S->>G: 15 pares estratificados (seed=42)
+    S->>G: pares estratificados, seed=42 (15 hasta Config D, 39 en Config F)
     loop por cada par
-        G->>G: retrieve() → contextos FAISS denso (Config D)
+        G->>G: retrieve() → fusión híbrida FAISS denso + BM25 (Config F)
         G->>G: gpt-oss-120b genera respuesta
         G->>G: mide latency_s
     end
@@ -481,13 +608,17 @@ sequenceDiagram
 | Config | N | Faithfulness | Ans. Correct. | Ans. Relev. | Ctx. Recall | Ctx. Prec. | Lat. (s) |
 |---|---|---|---|---|---|---|---|
 | A — FAISS puro | 15 | 0.162 | 0.350 | 0.635 | 0.000 | 0.000 | 11.35 |
-| B — FAISS+BM25 | 15 | 0.228 | 0.338 | 0.631 | 0.000 | 0.000 | 10.36 |
+| B — FAISS+BM25 (sobre Multiclinsum) | 15 | 0.228 | 0.338 | 0.631 | 0.000 | 0.000 | 10.36 |
 | C v1 — +LM 879tok | 15 | 0.133 | 0.378 | 0.691 | 0.033 | 0.143 | 10.26 |
 | C v2 — +LM 336tok | 15 | 0.359 | 0.337 | 0.631 | 0.067 | 0.083 | 10.10 |
-| **C v3 — +test+noclarif** | **14** | **0.456** | **0.532** | **0.816** | **0.452** | **0.388** | **10.23** |
+| C v3 — +test+noclarif | 14 | 0.456 | 0.532 | 0.816 | 0.452 | 0.388 | 10.23 |
+| D — sin textbook/multiclinsum, `llama-3.3-70b` (15-ago) | 14 | 0.497 | 0.551 | 0.733 | 0.452 | 0.360 | 9.58 |
+| E — D + HyDE (descartada) | 14 | 0.521 | 0.500 | 0.690 | 0.476 | 0.337 | 10.85 |
+| D — mismo retrieval, `gpt-oss-120b` (19-ago, tras migración forzada) | 15 | 0.392 | 0.636 | 0.810 | 0.422 | 0.336 | 12.49 |
+| **F — híbrido denso+BM25 + techo de recall corregido (28-ago, producción actual)** | **39** | **0.617** | **0.788** | **0.940** | **0.637** | **0.561** | **~16.1** |
 | Baseline MaternaQA-es | — | 0.713 | — | 0.558 | — | — | — |
 
-> `answer_relevancy` de Config C v3 (**0.816**) supera el baseline publicado (0.558).
+> `answer_relevancy` de Config F (**0.940**) es el valor más alto de toda la serie y supera ampliamente el baseline publicado (0.558). Frente a Config D (`gpt-oss-120b`), Config F mejora las **5 métricas a la vez** — detalle y explicación de cada delta en el banner al inicio de este documento y en `foragents/qa_technical.md` Q35. `faithfulness` (0.617) sigue por debajo del baseline (0.713); es un problema de generación, no de retrieval (ver §16 y §17).
 
 ### Configuración del judge
 
@@ -528,7 +659,7 @@ graph TD
     subgraph Core["src/rag/"]
         CHAIN["chain.py<br/>Orquestador — chat() / chat_stream()"]
         CITE["citations.py"]
-        RTR["retriever.py<br/>FAISS denso (Config D)"]
+        RTR["retriever.py<br/>FAISS denso + BM25 (Config F)"]
     end
 
     subgraph Classifiers["src/classifiers/"]
@@ -581,28 +712,34 @@ graph TD
 Instancia global `settings` de Pydantic Settings. Lee `.env` al importar. Todas las claves de API, rutas y parámetros del sistema se centralizan aquí. Es un singleton mutable: `PATCH /admin/config` (ver sección 6) hace `setattr(settings, campo, valor)` sobre esta misma instancia, visible al instante en todos los módulos que la importaron.
 
 #### `src/api/main.py`
-Punto de entrada de la aplicación. Carga el índice FAISS en `lifespan` (startup) y detiene el subproceso del bot si está corriendo (shutdown). CORS abierto a `*` (pendiente de restringir en producción). Expone los 4 endpoints públicos (`/health`, `/chat`, `/chat/stream`, `/classify`) y registra los 3 routers administrativos (`documents_router`, `admin_router`, `bot_router`); también mantiene el buffer de logs en memoria (`_log_buffer`) que alimenta `GET /admin/logs`.
+Punto de entrada de la aplicación. Carga el índice FAISS en `lifespan` (startup) y detiene el subproceso del bot si está corriendo (shutdown). CORS abierto a `*` (pendiente de restringir en producción). Expone los 4 endpoints públicos (`/health`, `/chat`, `/chat/stream`, `/classify`) y registra los 3 routers administrativos (`documents_router`, `admin_router`, `bot_router`); también mantiene el buffer de logs en memoria (`_log_buffer`) que alimenta `GET /admin/logs`. `/chat` y `/chat/stream` llaman a `usage_sessions.touch()` con el `session_id`/`platform` del request y pasan `session_id` a `rag_chat()`/`rag_chat_stream()`.
 
 #### `src/api/auth.py`, `routes_documents.py`, `routes_admin.py`, `routes_bot.py`
-La auth (`require_admin_token`, header `X-Admin-Token`, fail-closed) se declara una sola vez por router — un endpoint nuevo bajo `/documents*` o `/admin*` no puede quedar sin proteger por descuido. `routes_documents.py` gestiona el índice en caliente; `routes_admin.py` expone evaluaciones (solo lectura), configuración editable (`GET`/`PATCH /admin/config`) y logs de la API; `routes_bot.py` es el mapeo HTTP delgado sobre `bot_supervisor.py`. Detalle completo en la sección 6.
+La auth (`require_admin_token`, header `X-Admin-Token`, fail-closed) se declara una sola vez por router — un endpoint nuevo bajo `/documents*` o `/admin*` no puede quedar sin proteger por descuido. `routes_documents.py` gestiona el índice en caliente; `routes_admin.py` expone evaluaciones (solo lectura), configuración editable (`GET`/`PATCH /admin/config`), logs de la API y `GET /admin/usage_sessions`; `routes_bot.py` es el mapeo HTTP delgado sobre `bot_supervisor.py`. Detalle completo en la sección 6.
 
 #### `src/api/bot_supervisor.py`
 Arranca/detiene/reinicia `bot/maternas_bot.py` como subproceso hijo (`subprocess.Popen`), con un hilo lector volcando su stdout a un buffer en memoria. Estado protegido por lock (evita dos procesos concurrentes ante doble click). Distingue `crashed` (terminó solo) de detención manual — necesario en Windows, donde `Popen.terminate()` no deja rastro de señal real.
 
+#### `src/api/usage_sessions.py`
+Registro en memoria (dict + lock) de sesiones activas por `session_id`: `{platform, started_at, last_activity, tokens_total}`. `touch()` se llama en cada turno de `/chat`/`/chat/stream`; `active_by_platform()` poda las sesiones inactivas por más de `IDLE_TIMEOUT_SECONDS` (15 min) y devuelve la vista agrupada por plataforma, ordenada por duración descendente. Nunca expone el `session_id`. Ver sección 6 (Uso en tiempo real).
+
 #### `src/rag/chain.py`
-Módulo más crítico del sistema. Implementa el flujo completo de un turno conversacional (clasificar → detectar riesgo → clarificación → notificar → recuperar → generar → citar), compartido entre `chat()` (respuesta única) y `chat_stream()` (generador de eventos NDJSON, notificación en hilo aparte para no bloquear los `delta`). Gestiona el historial (últimos 6 turnos) y construye el system prompt dinámico según nivel de riesgo. El singleton de Groq (`_groq_client`) se inicializa en el primer uso y se puede forzar a reconstruir con `reset_client()` (usado cuando `GROQ_API_KEY` cambia en caliente).
+Módulo más crítico del sistema. Implementa el flujo completo de un turno conversacional (clasificar → detectar riesgo → clarificación → dedup de episodio + notificar → recuperar → generar → citar), compartido entre `chat()` (respuesta única) y `chat_stream()` (generador de eventos NDJSON, notificación en hilo aparte para no bloquear los `delta`). Gestiona el historial (últimos 6 turnos) y construye el system prompt dinámico según nivel de riesgo. Ambas funciones aceptan `session_id` opcional, que pasan a `_run_notification()` para deduplicar por episodio (ver `risk_episodes.py` abajo) y usan para armar la secuencia de mensajes del email de alerta (`_build_notification_conversation()`, historial + mensaje actual, tope `NOTIFICATION_HISTORY_CAP=20`). El singleton de Groq (`_groq_client`) se inicializa en el primer uso y se puede forzar a reconstruir con `reset_client()` (usado cuando `GROQ_API_KEY` cambia en caliente).
+
+#### `src/rag/risk_episodes.py`
+Deduplica notificaciones de riesgo por sesión, en memoria (mismo criterio que `usage_sessions.py`, definido aparte para no invertir la dirección de dependencia entre capas — `src/rag/` nunca importa de `src/api/`). API de dos fases: `is_new_signal()` es de solo lectura (decide si vale la pena seguir evaluando, y para riesgo medio si vale la pena llamar al LLM de decisión); `commit()` se llama únicamente cuando el correo **ya se envió de verdad** — así un riesgo medio que el LLM termina descartando no queda marcado como notificado. `register_low()` cierra el episodio de inmediato ante un turno de riesgo bajo. Sin `session_id` (llamadas internas/eval) no hay forma de deduplicar y se preserva el comportamiento de notificar siempre que el nivel lo amerite. Detalle en la sección **9.5**.
 
 #### `src/rag/citations.py`
 Separado de `retriever.py` a propósito (ese archivo es un snapshot intercambiable entre configs — ver docstring de `retriever.py`). Resuelve el nombre legible del documento de origen de cada fragmento (`document_name()`), su localizador de página (`document_locator()`) y arma el bloque final `Fuentes:` agrupando citas `[n]` por documento (`build_reference_block()`). `chain.py` llama primero a `normalize_citation_brackets()` sobre la respuesta completa: `gpt-oss-120b` cita de forma intermitente con corchetes CJK de ancho completo (`【1】`) en vez de ASCII (`[1]`), y sin esta normalización `build_reference_block()` no reconoce esas citas y el bloque `Fuentes:` se pierde en silencio (hallazgo documentado en `qa_technical.md` Q34).
 
 #### `src/rag/retriever.py` (y variantes históricas A/B/C/D/E)
-Config activa en producción: **Config D**, búsqueda 100% densa FAISS sobre `medmcqa` + `medqa_*` + `maternaqaes_lm` (sin BM25, sin `textbook`/`multiclinsum`). La separación en archivos independientes permite intercambiar arquitecturas copiando el archivo deseado sobre `retriever.py`; todas comparten la misma interfaz pública `retrieve(query, k, k_bm25=0)` / `format_context(docs, max_chars)` — `k_bm25` se conserva en la firma por compatibilidad con las variantes históricas que sí usaban BM25, aunque Config D lo ignora.
+Config activa en producción: **Config F**, híbrido — pool denso FAISS (`medmcqa`+`medqa_*`+`maternaqaes_lm`+`upload`) y pool léxico BM25 (`maternaqaes_lm`+`upload`, vía `bm25_index.py`), fusionados por RRF (o ponderada, configurable) antes de devolver el top-k final. Sin `textbook`/`multiclinsum` (removidos por licencia, sección 16). La separación en archivos independientes permite intercambiar arquitecturas copiando el archivo deseado sobre `retriever.py`; todas comparten la misma interfaz pública `retrieve(query, k, k_bm25=None)` / `format_context(docs, max_chars)` — `k_bm25` se conserva en la firma por compatibilidad histórica pero ya no se usa en Config F: el tamaño del pool léxico se controla vía `settings.rag_bm25_pool`.
 
 #### `src/classifiers/intent_classifier.py`
 Clasificador zero-shot. 12 intents válidos. Tres niveles de fallback garantizan que siempre devuelva un intent válido, incluso sin conexión a Groq.
 
 #### `src/classifiers/risk_detector.py`
-Dos capas de detección. La capa heurística (diccionarios de keywords por categoría de riesgo) no consume tokens y tiene latencia ~0ms. Solo cuando la heurística devuelve `low` se realiza la llamada al LLM de confirmación.
+Dos capas de detección. La capa heurística (diccionarios de keywords por categoría de riesgo) evalúa **solo el mensaje actual** — no consume tokens, latencia ~0ms, y no se combina con el historial (antes sí lo hacía, lo que "contaminaba" turnos posteriores no relacionados: una keyword de alarma en un turno viejo seguía matcheando en cada turno siguiente). Solo cuando la heurística no detecta nada se llama al LLM, que sí considera los últimos `RISK_HISTORY_USER_TURNS=2` turnos previos de la usuaria, pero con instrucción explícita (en el `SYSTEM_PROMPT` y en el prompt por-mensaje) de evaluar el mensaje actual aislado cuando no tiene relación clínica con lo anterior. El LLM reutiliza el mismo vocabulario de categorías de `flags` que la heurística (`_KNOWN_FLAG_CATEGORIES`), para que ambas capas sean comparables por `risk_episodes.py`.
 
 #### `src/ingestion/store.py`
 `FAISSStore` encapsula `faiss.IndexFlatIP` con 768 dimensiones. La normalización L2 implícita convierte el producto interno en similitud coseno. Gestiona dos archivos en disco: `index.faiss` y `metadata.pkl` con el texto y metadatos de cada vector, además de `active`/`mutation_seq` para el panel de administración (activación/desactivación de documentos sin renumerar vectores).
@@ -611,7 +748,7 @@ Dos capas de detección. La capa heurística (diccionarios de keywords por categ
 Singleton de `SentenceTransformer('intfloat/multilingual-e5-base')`. Requiere prefijos `"query: "` para queries y `"passage: "` para documentos (mandatorio en multilingual-e5, ver Q5 en `qa_technical.md`). Se carga en CUDA si `EMBEDDING_DEVICE=cuda`.
 
 #### `src/skills/`
-Sistema extensible de herramientas. `ToolRegistry` es un dict de clase que permite registrar y ejecutar tools por nombre. `NotifierSkill` se auto-registra al importar `src.skills.notifier`. Para añadir una nueva skill: crear `src/skills/mi_skill/`, heredar de `Skill`, registrar en `chain.py`.
+Sistema extensible de herramientas. `ToolRegistry` es un dict de clase que permite registrar y ejecutar tools por nombre. `NotifierSkill` se auto-registra al importar `src.skills.notifier`. Para añadir una nueva skill: crear `src/skills/mi_skill/`, heredar de `Skill`, registrar en `chain.py`. `notify_risk()` (`notifier/tool.py`) acepta un parámetro opcional `conversation: list[dict]` — la secuencia de turnos que llevó a la alerta, armada por `chain.py`; el cuerpo del email la lista completa marcando cuál mensaje disparó la alerta, con fallback a mostrar solo `query` si `conversation` no viene.
 
 #### `src/evaluation/eval_pipeline.py`
 Pipeline offline (no se ejecuta en producción). Dos fases separadas permiten regenerar respuestas y re-evaluar independientemente. El JSON de fase 1 contiene todo lo necesario para re-ejecutar fase 2 sin volver a llamar al chatbot. Sus resultados se sirven de solo lectura vía `GET /admin/evaluations*` (ver sección 6).
@@ -630,15 +767,16 @@ sequenceDiagram
     participant CHAIN as chain.py<br/>chat()
     participant IC as IntentClassifier
     participant RD as RiskDetector
-    participant RTR as Retriever<br/>(FAISS denso, Config D)
+    participant RTR as Retriever<br/>(híbrido FAISS+BM25, Config F)
     participant FAISS as FAISSStore
     participant CITE as citations.py
     participant GROQ as Groq LLM<br/>settings.groq_model
+    participant EP as risk_episodes.py
     participant SMTP as Notifier<br/>SMTP
 
     U->>IF: "me duele la cabeza fuerte"
-    IF->>API: POST /chat {message, history}
-    API->>CHAIN: chat(query, history, k)
+    IF->>API: POST /chat {message, history, session_id}
+    API->>CHAIN: chat(query, history, k, session_id)
 
     CHAIN->>IC: classify_intent(query, history)
     IC->>GROQ: zero-shot JSON → intent
@@ -646,13 +784,18 @@ sequenceDiagram
     IC-->>CHAIN: IntentResult
 
     CHAIN->>RD: detect_risk(query, intent, history)
-    RD->>RD: heurística keywords → "high" (dolor de cabeza intenso)
+    RD->>RD: heurística keywords SOLO del mensaje actual → "high" (dolor de cabeza intenso)
     RD-->>CHAIN: RiskResult(level="high", flags=["dolor_intenso"])
 
     CHAIN->>CHAIN: _should_clarify() → False (risk != low)
 
-    CHAIN->>SMTP: _run_notification() → notify_risk(query, "high", intent, reasoning)
+    CHAIN->>EP: is_new_signal(session_id, "high", ["dolor_intenso"])
+    EP-->>CHAIN: True (episodio nuevo o señal distinta)
+    CHAIN->>CHAIN: _build_notification_conversation()<br/>historial (tope 20) + mensaje actual
+    CHAIN->>SMTP: notify_risk(query, "high", intent, reasoning, conversation=[...])
     SMTP-->>CHAIN: {"success": true}
+    CHAIN->>EP: commit(session_id, "high", ["dolor_intenso"])
+    Note over EP: solo se llama commit() al confirmar el envío —<br/>ver sección 9.5 para el detalle de la deduplicación
 
     CHAIN->>RTR: retrieve(query, k=5)
     RTR->>FAISS: search(embed("query: " + query), k=50)
@@ -699,7 +842,7 @@ sequenceDiagram
         CHAIN->>ST: {"type":"done", tokens_used:0}
     else responde normalmente
         CHAIN->>NT: arranca en background (daemon thread)
-        Note over NT: notify_risk() si high, o LLM barato si medium — no bloquea lo que sigue
+        Note over NT: risk_episodes.is_new_signal() primero (dedup) →<br/>notify_risk() si high, o LLM barato si medium — no bloquea lo que sigue
         CHAIN->>ST: {"type":"status","stage":"retrieving"}
         CHAIN->>RTR: retrieve() + format_context()
         RTR-->>CHAIN: docs, messages
@@ -719,6 +862,62 @@ sequenceDiagram
     end
     ST-->>U: texto renderizado token a token + fuentes por nombre de documento
 ```
+
+### 9.5 Deduplicación de notificaciones de riesgo por episodio
+
+**Problema que resuelve:** antes de este cambio, cada turno con riesgo medium/high disparaba `notify_risk()` de cero. Combinado con que la capa heurística "contaminaba" turnos posteriores con keywords de mensajes viejos (ver sección 8, `risk_detector.py`), un mensaje sin ninguna relación clínica con lo anterior (un simple "gracias") podía seguir generando correos de alerta durante varios turnos. `src/rag/risk_episodes.py` deduplica por `session_id`, en memoria, guardando solo `{level, flags}` de la última alerta **efectivamente enviada** (nunca texto clínico).
+
+El siguiente diagrama es el escenario validado en vivo (contra Groq + SMTP real) que ejercita las cuatro reglas del módulo: alerta nueva → mensaje no relacionado no reenvía → riesgo distinto sí reenvía → repetir la misma señal no reenvía.
+
+```mermaid
+sequenceDiagram
+    actor U as Usuario
+    participant CHAIN as chain.py<br/>_run_notification()
+    participant EP as risk_episodes.py
+    participant SMTP as Notifier SMTP
+
+    Note over U,SMTP: Turno 1 — "Estoy sangrando mucho" (session_id=S1)
+    CHAIN->>EP: is_new_signal(S1, "high", ["hemorragia"])
+    EP-->>CHAIN: True (sin episodio previo)
+    CHAIN->>SMTP: notify_risk(conversation=[msg1])
+    CHAIN->>EP: commit(S1, "high", ["hemorragia"])
+    Note over EP: episodio S1 = {level:"high", flags:{"hemorragia"}}
+
+    Note over U,SMTP: Turno 2 — "gracias, ya me siento mas tranquila" (mismo S1)
+    Note over CHAIN: risk_detector ya NO combina la keyword vieja —<br/>el LLM evalúa el mensaje actual aislado → level="low"
+    CHAIN->>EP: register_low(S1)
+    Note over EP: episodio S1 se cierra (pop del dict)
+    Note over CHAIN: level="low" nunca notifica
+
+    Note over U,SMTP: Turno 3 — "tuve una convulsion" (mismo S1)
+    CHAIN->>EP: is_new_signal(S1, "high", ["eclampsia_convulsion"])
+    EP-->>CHAIN: True (episodio se había cerrado en el turno 2)
+    CHAIN->>SMTP: notify_risk(conversation=[msg1..msg3])
+    CHAIN->>EP: commit(S1, "high", ["eclampsia_convulsion"])
+
+    Note over U,SMTP: Turno 4 — "si, la convulsion fue fuerte" (mismo S1)
+    CHAIN->>EP: is_new_signal(S1, "high", ["eclampsia_convulsion"])
+    EP-->>CHAIN: False (misma señal ya notificada en el turno 3)
+    Note over CHAIN: no se llama a notify_risk — sin correo nuevo
+```
+
+**Por qué `commit()` no ocurre en `is_new_signal()`:** para riesgo `medium`, `_run_notification()` primero pregunta `is_new_signal()` (barato, sin llamar a Groq) y solo si es una señal nueva le pregunta a un LLM si amerita notificar. Si `commit()` se llamara dentro de `is_new_signal()`, un `medium` que ese LLM termina descartando (`"NO"`) quedaría registrado como si sí se hubiera avisado, y una repetición real de ese mismo riesgo después se suprimiría sin que nunca se haya mandado el primer correo. Por eso `commit()` se llama únicamente en el punto donde el envío ya se confirmó.
+
+**Reglas de `is_new_signal()`:**
+
+| Situación | ¿Nueva señal? |
+|---|---|
+| Sin episodio previo para la sesión | Sí |
+| Mismo nivel, flags ⊆ las del último aviso | No |
+| Nivel escala (ej. medium → high) | Sí |
+| Aparece una flag que no estaba en el último aviso | Sí |
+| Nivel baja pero las flags son las mismas | No |
+
+**Vocabulario de flags compartido:** para que la comparación de flags sea significativa entre la capa heurística (categorías fijas, ej. `hemorragia`) y la capa LLM (texto libre por defecto), el `SYSTEM_PROMPT` de `risk_detector.py` le pide al LLM reutilizar exactamente esas mismas categorías cuando el síntoma corresponde a una — sin esto, el LLM podía generar variantes como `"hemorragia activa"` en vez de `"hemorragia"`, y la deduplicación por string nunca reconocía que era la misma señal.
+
+**Contenido del email de alerta:** `_build_notification_conversation()` arma `history[-NOTIFICATION_HISTORY_CAP:]` (últimos 20 mensajes) + el mensaje actual al final. `notify_risk()` lista toda la secuencia en el cuerpo del correo, marcando con `<<< MENSAJE QUE DISPARO LA ALERTA` cuál fue el mensaje que generó ese envío específico.
+
+**Sin `session_id`** (llamadas internas como el pipeline de evaluación, que llama a `chain.chat()` directamente sin pasar por la API): `is_new_signal()` devuelve siempre `True` — no hay forma de deduplicar sin una sesión, así que se preserva el comportamiento anterior de notificar cada vez que el nivel lo amerite.
 
 ### Flujo de clarificación
 
@@ -830,6 +1029,8 @@ Configs A y B tienen `context_recall=0.000` y `context_precision=0.000` a pesar 
 
 ### Fuentes de datos indexadas
 
+> **Estado en producción (Config F):** de las cinco fuentes descritas abajo, **Textbooks médicos** y **MultiClinSum** fueron removidos del índice FAISS por riesgo de licencia no resuelto (sección 16, `foragents/qa_technical.md` Q28/Q31) y no participan en el retrieval activo. **MedMCQA**, **MedQA** y **MaternaQA-es LM** sí están indexados (255.625 vectores totales); **MaternaQA-es LM** además se indexa por separado en BM25 (`bm25_index.py`, junto con `upload`) para la rama léxica de la fusión híbrida.
+
 #### MedMCQA
 - **Origen:** Exámenes de admisión médica India (AIIMS/NEET PG)
 - **Formato crudo:** Parquet/JSON con campos `question`, `exp`, `opa/opb/opc/opd`, `cop` (correct option), `subject_name`, `topic_name`
@@ -875,9 +1076,9 @@ Configs A y B tienen `context_recall=0.000` y `context_precision=0.000` a pesar 
 }
 ```
 
-- **Filtro aplicado:** `clinical_score >= 15` (descarta intro, biblio, admin)
+- **Filtro aplicado:** `clinical_score >= 8` (antes `>= 15` hasta el 28-ago-2026; `--min-clinical-score` es parametrizable en `ingest_maternaqaes_lm.py`, default sigue en 15 para no romper reproducibilidad de reportes previos). El umbral se bajó a 8 tras identificar que los 90 pares no alcanzables del golden set de evaluación tenían su chunk-oro descartado exactamente por este filtro (`clinical_score` 8–14) — ver banner de este documento y `foragents/qa_technical.md` Q35.
 - **Chunking:** RecursiveCharacterTextSplitter 1600 chars / 320 overlap → ~336 tok promedio
-- **Vectores:** 5 353 sub-chunks | Idioma: ES
+- **Vectores:** 7 509 sub-chunks (+ 14 documentos subidos vía panel, fuente `upload`, también indexados por BM25) | Idioma: ES
 
 ### Schema del Document interno
 
@@ -929,6 +1130,7 @@ class Document:
 | `GET` | `/admin/config` | Configuración efectiva del proceso, secretos redactados a booleano | `X-Admin-Token` |
 | `PATCH` | `/admin/config` | Actualiza en caliente + persiste en `.env` un subconjunto fijo de 10 variables | `X-Admin-Token` |
 | `GET` | `/admin/logs` | Últimas líneas de log del proceso de la API + uptime | `X-Admin-Token` |
+| `GET` | `/admin/usage_sessions` | Sesiones activas de Streamlit/Telegram (duración + tokens), sin ningún identificador | `X-Admin-Token` |
 | `GET` | `/admin/bot/status` | Estado del subproceso del bot: running, pid, uptime, exit_code, crashed | `X-Admin-Token` |
 | `POST` | `/admin/bot/start` | Inicia el subproceso del bot (no-op si ya corre) | `X-Admin-Token` |
 | `POST` | `/admin/bot/stop` | Detiene el subproceso del bot (no-op si ya está detenido) | `X-Admin-Token` |
@@ -964,7 +1166,9 @@ class Document:
     {"role": "user",      "content": "Tengo 24 semanas"},
     {"role": "assistant", "content": "Entendido, ¿en qué puedo ayudarte?"}
   ],
-  "k": 5
+  "k": 5,
+  "session_id": "3f9c1e2a-...-uuid4",
+  "platform": "streamlit"
 }
 ```
 
@@ -973,6 +1177,8 @@ class Document:
 | `message` | `string` | ✅ | Consulta del usuario (min 1 char) |
 | `history` | `ChatMessage[]` | ✅ | Historial conversacional (puede ser `[]`) |
 | `k` | `integer` | ❌ | Número de fragmentos a recuperar (1–20, default: `RAG_TOP_K=5`) |
+| `session_id` | `string` | ❌ | Id aleatorio (uuid4) generado por el cliente, nunca derivado de un identificador real. Alimenta `GET /admin/usage_sessions` y la deduplicación de notificaciones de riesgo por episodio (`risk_episodes.py`). Sin él, ninguna de las dos cuenta ese turno |
+| `platform` | `"streamlit"` \| `"telegram"` | ❌ | Origen del turno, default `"streamlit"` — solo para agrupar en `/admin/usage_sessions` |
 
 **Response `200`:**
 ```json
@@ -1070,6 +1276,9 @@ Todas las variables se leen desde `.env` en la raíz del proyecto vía Pydantic 
 | `DATASET_MEDQA_PATH` | `./datasets/data_clean/data_clean` | Ruta al dataset MedQA crudo (solo para ingesta) |
 | `DATASET_MULTICLINSUM_PATH` | `./datasets/multiclinsum_large-scale_train_es/...` | Ruta al dataset MultiClinSum crudo (solo para ingesta; el dataset ya no se indexa en producción, ver nota de licencias) |
 
+> **Constantes no configurables (hardcodeadas a propósito, no son `.env`):**
+> `usage_sessions.IDLE_TIMEOUT_SECONDS` / `risk_episodes.IDLE_TIMEOUT_SECONDS` (15 min — una sesión sin turnos nuevos deja de contarse como activa), `chain.NOTIFICATION_HISTORY_CAP` (20 — mensajes de historial que se incluyen en el email de alerta), `risk_detector.RISK_HISTORY_USER_TURNS` (2 — turnos previos de la usuaria que la capa LLM del detector de riesgo considera). Son parámetros de comportamiento interno, no credenciales ni configuración de despliegue — se dejaron fuera de `.env` para no inflarlo con valores que en la práctica no varían entre entornos.
+
 ---
 
 ## 14. Instalación y Ejecución Local
@@ -1078,7 +1287,7 @@ Todas las variables se leen desde `.env` en la raíz del proyecto vía Pydantic 
 
 - Python 3.12.7
 - CUDA 12.1 (opcional, recomendado para ingesta)
-- ~2 GB RAM libres para cargar el índice FAISS (retrieval 100% denso, sin BM25 desde Config D)
+- ~2 GB RAM libres para cargar el índice FAISS + el índice léxico BM25 (Config F, ~7.500 fragmentos, construido en memoria a partir de la metadata ya cargada — no duplica RAM)
 
 ### Instalación
 
@@ -1138,18 +1347,21 @@ python src/bot/maternas_bot.py
 ### Ejecutar la evaluación Ragas
 
 ```bash
-# Paso 1: Activar arquitectura a evaluar
-copy src\rag\retriever_configC.py src\rag\retriever.py   # Windows
-# cp src/rag/retriever_configC.py src/rag/retriever.py   # Linux
+# Paso 1: Activar arquitectura a evaluar (ejemplo: comparar contra Config D)
+copy src\rag\retriever_configD.py src\rag\retriever.py   # Windows
+# cp src/rag/retriever_configD.py src/rag/retriever.py   # Linux
 
 # Paso 2: Generar respuestas (requiere GROQ_API_KEY con cuota disponible)
-python src/evaluation/eval_pipeline.py --config configC --sample 15 --generate-only
+python src/evaluation/eval_pipeline.py --config configD --sample 15 --generate-only
 
 # Paso 3: Evaluar con Ragas (requiere CEREBRAS_KEY, ~40-50 min para 15 pares)
-python src/evaluation/eval_pipeline.py --evaluate-only evaluation_reports/eval_raw_configC_<ts>.json
+python src/evaluation/eval_pipeline.py --evaluate-only evaluation_reports/eval_raw_configD_<ts>.json
 
-# Paso 4: Restaurar Config B a producción
-copy src\rag\retriever_configB.py src\rag\retriever.py
+# Paso 4: Restaurar Config F a producción
+copy src\rag\retriever_configF.py src\rag\retriever.py
+
+# Alternativa recomendada — sin juez LLM, cubre los 328 pares, ~1 min:
+python -m src.evaluation.retrieval_eval --compare dense,bm25,hybrid
 ```
 
 ### Tests
@@ -1158,7 +1370,7 @@ copy src\rag\retriever_configB.py src\rag\retriever.py
 ./venv/Scripts/python.exe -m pytest -q
 ```
 
-Suite de `pytest` en `tests/` (clasificadores, gestión de documentos, config editable, supervisor del bot, citas, chat streaming, usuarios activos). Los fixtures de `tests/conftest.py` evitan cargar el índice FAISS real (780 MB) y resetean los singletons de clientes Groq cacheados entre tests. Las pruebas manuales de flujo end-to-end siguen documentadas en `foragents/test_cases.md`.
+**307 tests** en `tests/` (clasificadores, gestión de documentos, config editable, supervisor del bot, citas, chat streaming, usuarios activos, sesiones de uso en tiempo real, deduplicación de notificaciones de riesgo por episodio, contenido del email de alerta, índice léxico BM25 y fusión de retrieval híbrido — `test_bm25_index.py`, `test_retriever_fusion.py`, 27 tests). Los fixtures de `tests/conftest.py` evitan cargar el índice FAISS real (780 MB) y resetean los singletons de clientes Groq cacheados entre tests. Las pruebas manuales de flujo end-to-end siguen documentadas en `foragents/test_cases.md`; el escenario completo de deduplicación de riesgo (4 turnos, validado en vivo contra Groq + SMTP real) está en la sección **9.5**.
 
 ---
 
@@ -1182,16 +1394,32 @@ No existe pipeline de CI/CD, Dockerfile ni configuración de despliegue en el re
 |---|---|---|
 | **FAISS IndexFlatIP** sobre IndexIVFFlat | IndexIVFFlat (clustering aproximado) | ~375k vectores → búsqueda exacta en 20–50ms. IndexIVFFlat solo necesario a partir de millones de vectores. Sin pérdida de calidad de búsqueda. |
 | **multilingual-e5-base** (768 dims) | MiniLM (384 dims), BGE | Soporte nativo ES/EN/ZH en un solo modelo. Prefijos `"query:"` / `"passage:"` obligatorios; sin ellos los scores bajan ~15%. |
-| **BM25 separado de FAISS** (Config B) | FAISS uniforme sobre todo el corpus | MultiClinSum (casos clínicos) contamina el contexto cuando compite en FAISS densa con conocimiento factual. BM25 léxico solo activa MultiClinSum con coincidencia real. |
+| **BM25 separado de FAISS** (Config B, histórico) | FAISS uniforme sobre todo el corpus | MultiClinSum (casos clínicos) contamina el contexto cuando compite en FAISS densa con conocimiento factual. BM25 léxico solo activa MultiClinSum con coincidencia real. Eliminado en Config D al remover Multiclinsum del índice — por licencia, no por rendimiento. |
+| **BM25 reincorporado sobre `maternaqaes_lm`+`upload`, fusión RRF** (Config F, producción) | Mantenerlo descartado (Config D); reincorporarlo sobre Multiclinsum como en Config B | Con `multilingual-e5-base` el denso ya separa fuentes sin ayuda — MedMCQA+MedQA (97,8% del índice) nunca entran al top-5 en español. El valor de BM25 está en desempate léxico exacto (fármacos, dosis, cifras, siglas) dentro del corpus obstétrico correcto, no en filtrar ruido. Medido: Recall@5 0,838→0,915 (harness determinista, sección 7). |
+| **`MIN_CLINICAL_SCORE` bajado de 15 a 8** en la ingesta de `maternaqaes_lm` | Mantener 15 y compensar solo con mejor fusión de retrieval | Los 90 pares no alcanzables del golden set tenían su chunk-oro fuera del índice por umbral de ingesta, no por defecto de retrieval; re-ingesta incremental (deduplicada por `chunk_id`) llevó la alcanzabilidad de 72,6% a 100% (sección 11). |
+| **Harness de retrieval determinista** (`retrieval_eval.py`) como instrumento de ajuste, Ragas reservado como métrica oficial | Ajustar hiperparámetros de fusión directamente con Ragas | Con 15-20 pares y juez LLM, Ragas no distingue una mejora de Recall@5 de unos pocos puntos del ruido de evaluación (~0,25 std); el harness mide los 328 pares del golden set completo sin costo de tokens. |
 | **Groq `openai/gpt-oss-120b`** para generación (migrado desde `llama-3.3-70b-versatile`) | `qwen/qwen3.6-27b` (alternativa sugerida por Groq), OpenAI GPT-4, LLM local | Groq dio de baja `llama-3.3-70b-versatile` el 16-ago-2026 — cambio forzado, no una comparación libre. `gpt-oss-120b` es el reemplazo oficial de Groq: mismo tier gratuito, mayor velocidad (~500 tok/s vs ~275) y ventana de contexto (131k vs 128k). Al ser un modelo de razonamiento, requirió además `reasoning_format:"hidden"` y subir los topes de `max_tokens` en los 6 call sites del LLM (`src/settings.py::groq_reasoning_kwargs()`) para que el presupuesto de razonamiento no vaciara la respuesta útil ni la decisión de notificación de riesgo medio. |
 | **Cerebras gemma-4-31b** para Ragas judge | Groq gpt-oss-120b, Groq llama-3.1-8b (dado de baja, reemplazo `openai/gpt-oss-20b`) | Sin límite diario de tokens; el juez debe ser independiente del modelo generador en cualquier caso. Cerebras: JSON válido, ~296 tok/par. |
 | **Chunking ~336 tok** para MaternaQA-es LM | Chunks originales ~879 tok | Faithfulness de 0.133 → 0.359 al re-chunkar. Chunks más cortos permiten al juez Ragas localizar afirmaciones concretas. |
 | **Heurística + LLM en cascada** para riesgo | LLM solo | Heurística: latencia 0ms, determinismo, sin costo de API para casos obvios (hemorragia, convulsión). LLM solo para casos ambiguos. |
 | **Historial de 6 turnos** | Historial completo | Equilibrio entre contexto conversacional y ventana de contexto del LLM. Más de 6 turnos incrementa costo de tokens sin mejora perceptible. |
-| **Sin fine-tuning** | QLoRA, LoRA | Restricción explícita del proyecto. El RAG con corpus especializado compensa la falta de fine-tuning para el dominio. |
+| **Sin fine-tuning de modelos generadores** | QLoRA, LoRA (probados en etapas previas del proyecto) | Límites de infraestructura (requeriría GPU dedicada para entrenamiento e inferencia) y alto costo computacional frente a servir modelos ya entrenados vía API. El RAG con corpus especializado compensa la falta de fine-tuning para el dominio — ver detalle debajo. |
 | **NDJSON sobre `StreamingResponse`** para `/chat/stream` | WebSocket, Server-Sent Events | Un endpoint HTTP normal basta para un stream unidireccional servidor→cliente; NDJSON es trivial de parsear línea por línea en `httpx.iter_lines()`, sin librería de WebSocket en ningún lado del stack. |
 | **Bot de Telegram como subproceso hijo de la API** (`subprocess.Popen`) | systemd/Docker/supervisor externo, IPC en caliente hacia el proceso del bot | El proyecto corre en una sola máquina sin orquestador; un subproceso administrado por la propia API es suficiente para iniciar/detener/reiniciar desde la UI, y evita construir sincronización en caliente entre dos procesos para 4 variables que el bot solo lee al arrancar. |
 | **Campos Pydantic fijos (`extra="forbid"`)** para `PATCH /admin/config`, en vez de un `{key, value}` genérico | Endpoint genérico de key/value | Un endpoint que escribe en `.env` es superficie de inyección de configuración; con campos fijos no existe forma de pedirle que toque una variable fuera de la lista declarada (p. ej. `ADMIN_API_TOKEN`) — un campo desconocido es `422`, nunca se aplica ni se ignora en silencio. |
+| **`session_id` aleatorio (uuid4) generado por el cliente**, nunca derivado de un chat_id de Telegram real | Reusar el hash SHA-256 de `chat_id` que ya existe en `maternas_bot.py`; no trackear sesiones en absoluto | Un hash de `chat_id`, aunque no revele la identidad, sigue siendo un identificador *estable*: correlacionaría todas las sesiones de la misma persona a lo largo del tiempo en la vista de métricas, algo que el requerimiento explícitamente pedía evitar ("no se debe poder diferenciar un usuario de otro"). Un uuid4 nuevo por sesión no permite esa correlación. |
+| **Deduplicación de notificaciones de riesgo en memoria (`risk_episodes.py`), guardando solo nivel+flags** | Persistir el episodio (como `active_users.json`, cifrado en disco); no deduplicar y notificar en cada turno | El proyecto ya había decidido (Q en `qa_technical.md`) no persistir banderas clínicas descriptivas ni siquiera cifradas — extender esa misma postura a un registro nuevo fue más simple que justificar una excepción. Notificar en cada turno fue directamente el bug reportado por el usuario a corregir. |
+
+### Sin fine-tuning de modelos generadores
+
+Este proyecto **no utiliza modelos LLM generadores fine-tuneados**. Los modelos de generación de respuesta (`gpt-oss-120b` vía Groq, `gemma-4-31b` vía Cerebras para el juez de evaluación) se usan **tal cual los sirve el proveedor**, mediante prompting (system prompt + few-shot cuando aplica) y RAG, sin ajuste de pesos.
+
+Durante etapas previas del desarrollo del proyecto sí se realizaron pruebas de fine-tuning sobre algunos LLMs. Se decidió **no incorporar esa vía en la versión actual** por dos motivos:
+
+- **Infraestructura:** fine-tunear y luego servir un modelo propio requiere GPU dedicada (entrenamiento e inferencia), lo que excede la infraestructura disponible para este proyecto.
+- **Costo computacional:** el consumo de cómputo de entrenar y mantener un modelo fine-tuneado es significativamente mayor que el de consumir modelos ya entrenados vía API, sin una ganancia de calidad que lo justifique frente al enfoque RAG (retrieval + prompting) usado aquí.
+
+El diseño actual delega la especialización de dominio al **retrieval** (corpus obstétrico + fusión híbrida BM25/denso, ver §10 y Config F en `foragents/retrieval_arquitecturas_configs.md`) en vez de al ajuste de pesos del modelo generador. Esto mantiene el sistema reproducible y operable sin infraestructura de entrenamiento propia. Ver también `foragents/qa_technical.md` Q36.
 
 ---
 
@@ -1203,19 +1431,27 @@ No existe pipeline de CI/CD, Dockerfile ni configuración de despliegue en el re
 |---|---|---|
 | **CORS abierto a `*`** | Cualquier origen puede consumir la API pública (`/health`, `/chat`, `/classify`); los endpoints admin sí quedan protegidos por `X-Admin-Token` | Restringir a URL de Streamlit en producción |
 | **Cuota de 100k tok/día en Groq** | Limita evaluaciones largas y uso intensivo | Dos claves rotativas (ya implementado), o migrar evaluación a Cerebras |
-| **faithfulness=0.456** vs baseline 0.713 | Brecha de ~26pp respecto al sistema de referencia | Ver mejoras propuestas (reranker, system prompt restrictivo) |
+| **faithfulness=0.617** (Config F) vs baseline 0.713 | Brecha de ~10pp respecto al sistema de referencia. Problema de **generación**, no de retrieval: el LLM no siempre se ancla literalmente en el contexto recuperado, aun cuando ese contexto ya es demostrablemente más completo y preciso (`context_recall` 0,637, `context_precision` 0,561 en Config F). Verificado que **no** es por ausencia de los PDFs fuente del benchmark en el índice — sí están indexados (data leakage estructural preexistente, sección 11 y `qa_technical.md` Q35) | System prompt más restrictivo (no implementado, backlog abajo); Config F ya cerró parte de la brecha (+0,226 vs Config D) sin tocar el prompt |
 | **Sin despliegue automatizado** | Requiere setup manual en cada máquina | Dockerizar API + Streamlit |
 | **`--workers 1` obligatorio en uvicorn** | El `FAISSStore` singleton, sus locks, y `bot_supervisor` son estado por-proceso; con `--workers N>1` cada worker mantendría una copia divergente del índice y un subproceso del bot propio | Documentado explícitamente en `main.py`; no hay mitigación sin repensar el estado como externo (Redis, DB) |
 | **Self-restart de la propia API no implementado** | La consola solo reporta el estado de la API (uptime/logs), no puede reiniciarla | A propósito — decisión documentada (fragilidad de auto-matar el propio proceso, bajo valor cuando `uvicorn` ya se controla por terminal) |
+| **`usage_sessions.py` / `risk_episodes.py` viven solo en memoria** | Ambos registros (sesiones activas, episodios de riesgo notificados) se pierden al reiniciar la API — mismo criterio MVP que `histories` en el bot | Aceptado a propósito: no hay dato identificable que proteger con persistencia, y sobrevivir un reinicio no es necesario para una vista de monitoreo en vivo ni para deduplicar correos dentro de una misma sesión activa |
+| **Un refresh duro del navegador en Streamlit genera un `session_id` nuevo** | Cuenta como una sesión de uso nueva y cierra el episodio de riesgo en curso (una alerta ya notificada podría "reabrirse" tras el refresh, aunque el nivel/flags no cambiaron) | No solucionable sin cookies/localStorage — cada refresh de Streamlit es, en los hechos, una sesión de servidor nueva |
+| **El vocabulario de `flags` del LLM depende de que el modelo siga la instrucción del prompt** | Si Groq cambia de modelo (ver migración a `gpt-oss-120b`) y el nuevo modelo ignora la lista de categorías conocidas, la deduplicación por episodio podría no reconocer una flag equivalente con otro nombre y renotificar de más (nunca de menos: el peor caso es un correo extra, no uno perdido) | Monitorear tras cualquier cambio de `GROQ_MODEL`; ya ocurrió una vez durante el desarrollo de esta función (ver sección 9.5) |
+| **Data leakage estructural en el golden set de evaluación** (todos los reportes `eval_report_config{A..F}_*.md`) | Los 3 PDFs fuente del split `test` de `maternaqaes_lm` son exactamente los mismos de los que sale el golden set completo — `ingest_maternaqaes_lm.py` los incluye por defecto (`include_test=True`) desde antes de Config F. Las métricas miden honestamente "¿el sistema desplegado encuentra el pasaje correcto?", no generalización a documentos nunca vistos | `--exclude-test` existe en el script pero nunca se ha usado en producción; no corregido — decisión de diseño ya tomada, documentada aquí por primera vez. Ver `foragents/qa_technical.md` Q35 |
 
 ### Trabajo pendiente (backlog)
 
-- [ ] **Reranker cross-encoder local** (`BAAI/bge-reranker-v2-m3`) — k=20 candidatos → top-5 al LLM
-- [ ] **System prompt más restrictivo** — LLM debe declarar explícitamente "no tengo información suficiente"
+- [ ] **Reranker cross-encoder local** (`BAAI/bge-reranker-v2-m3`) — sobre el pool de 20 candidatos por rama de la fusión híbrida (Config F), antes de devolver el top-5 al LLM
+- [ ] **System prompt más restrictivo** — LLM debe declarar explícitamente "no tengo información suficiente"; siguiente candidato directo para cerrar la brecha de `faithfulness` (sección 7)
 - [x] ~~**HyDE** (Hypothetical Document Embeddings)~~ — probado (`retriever_configE.py`), descartado: sin mejora medible sobre Config D (deltas dentro del ruido, 14 pares) y con costo real de latencia (+~1.3s/turno) y cuota Groq. Ver `foragents/qa_technical.md` Q32.
-- [x] **Tests unitarios** para clasificadores, gestión de documentos, config editable, supervisor del bot, citas y chat streaming — ver sección 14
+- [x] **Retrieval híbrido denso+BM25 y eliminación del techo de recall** (Config F) — Recall@5 0,838→0,915 (harness), las 5 métricas Ragas mejoran a la vez frente a Config D. Ver sección 7 y banner al inicio de este documento.
+- [x] **Ampliar muestra de evaluación Ragas** — n=39 en la corrida Config F (antes n=14-15)
+- [x] **Tests unitarios** para clasificadores, gestión de documentos, config editable, supervisor del bot, citas, chat streaming, índice BM25 y fusión híbrida — 307/307 al commit `2b1e4c6`
+- [x] **Métricas de uso en tiempo real** — sesiones activas Streamlit/Telegram anonimizadas (duración + tokens, sin identificadores) — ver sección 6
+- [x] **Deduplicación de notificaciones de riesgo por episodio** — corrige el reenvío de correos por contaminación de historial y adjunta la secuencia completa de mensajes — ver sección 9.5
 - [ ] **Web search skill** — fallback Tavily cuando el vector store no cubre el tema
-- [ ] **Persistencia de historial** — SQLite o Redis para el bot Telegram
+- [ ] **Persistencia de historial** — SQLite o Redis para el bot Telegram (extendería también a `usage_sessions.py`/`risk_episodes.py`, hoy en memoria)
 - [ ] **Dockerización** — Dockerfile para API + Streamlit
 - [ ] **Corpus ampliado** — guías OMS, FIGO, guías nacionales latinoamericanas adicionales
 - [ ] **Ampliación muestra de evaluación** — 30 pares para reducir varianza (std actual ~0.31)
@@ -1229,15 +1465,18 @@ No existe pipeline de CI/CD, Dockerfile ni configuración de despliegue en el re
 | **RAG** | Retrieval-Augmented Generation: arquitectura que combina búsqueda en una base de conocimiento con generación de texto por un LLM |
 | **FAISS** | Facebook AI Similarity Search: biblioteca de búsqueda eficiente de vectores densos |
 | **IndexFlatIP** | Tipo de índice FAISS que computa similitud por producto interno (equivalente a coseno con vectores L2-normalizados) sin aproximación |
-| **BM25** | Best Match 25: algoritmo de ranking léxico basado en frecuencia de términos; se usa para búsqueda exacta en MultiClinSum |
+| **BM25** | Best Match 25: algoritmo de ranking léxico basado en frecuencia de términos (`rank-bm25`, `k1=1.5, b=0.75`); en Config F indexa `maternaqaes_lm`+`upload` (~7.500 frags) como rama léxica de la fusión híbrida — históricamente (Config B) se usó sobre MultiClinSum |
+| **RRF (Reciprocal Rank Fusion)** | Estrategia de fusión de rankings: suma `1/(k+rank+1)` por cada lista (densa, léxica) en la que aparece un fragmento; estrategia por defecto de la fusión híbrida en Config F (`settings.rag_fusion_strategy`), robusta porque no depende de que los scores de FAISS y BM25 sean comparables |
 | **Intent** | Categoría de intención detectada en la consulta del usuario (ej: `signos_de_alarma`, `medicamentos`) |
 | **Risk level** | Nivel de urgencia clínica: `low` (educativo), `medium` (consulta médica), `high` (urgencia) |
 | **Clarification query** | Consulta donde el sistema pide más contexto al usuario antes de responder; tiene `needs_clarification=True` |
+| **`session_id`** | Identificador aleatorio (uuid4) generado por el cliente (Streamlit/bot de Telegram), nunca derivado de un dato real — clave interna de `usage_sessions.py` y `risk_episodes.py`, nunca expuesto en ninguna respuesta de la API |
+| **Episodio de riesgo** | Ventana de tiempo, por sesión, durante la cual una misma señal de riesgo (nivel + categorías de flags) ya fue notificada — ver `risk_episodes.py`, sección 9.5 |
 | **Faithfulness** | Métrica Ragas: fracción de afirmaciones de la respuesta que están respaldadas por los fragmentos recuperados |
 | **Context recall** | Métrica Ragas: proporción del ground truth cubierta por los fragmentos recuperados |
 | **Chunk** | Fragmento de texto resultante de dividir un documento largo para indexación |
-| **clinical_score** | Puntuación de relevancia clínica (0–20) asignada a cada chunk del corpus MaternaQA-es LM; chunks con score < 15 son descartados |
-| **Config A/B/C** | Variantes de arquitectura de retrieval evaluadas: A=FAISS puro, B=FAISS+BM25, C=B+corpus obstétrico ES |
+| **clinical_score** | Puntuación de relevancia clínica (0–20) asignada a cada chunk del corpus MaternaQA-es LM; chunks con score < 8 son descartados (umbral bajado de 15 a 8 en Config F para cerrar el techo de alcanzabilidad del golden set — ver sección 11) |
+| **Config A–F** | Variantes de arquitectura de retrieval evaluadas: A=FAISS puro, B=FAISS+BM25 (sobre Multiclinsum), C=B+corpus obstétrico ES, D=sin textbook/multiclinsum (denso puro), E=D+HyDE (descartada), **F=D+BM25 híbrido sobre maternaqaes_lm/upload + techo de recall corregido (producción actual)** |
 | **MaternaQA-es** | Dataset de QA obstétrico en español generado a partir de guías clínicas colombianas |
 | **Groq** | Proveedor de inferencia LLM con hardware LPU; se usa por su baja latencia y tier gratuito |
 | **Cerebras** | Proveedor de inferencia LLM; se usa como juez Ragas por no tener límite diario de tokens |
@@ -1247,4 +1486,4 @@ No existe pipeline de CI/CD, Dockerfile ni configuración de despliegue en el re
 
 ---
 
-*Documentación generada en Julio 2026, ampliada en Agosto 2026 (panel de administración, configuración editable, supervisor del bot, streaming + citas por documento). Verificada contra el código fuente del commit `5d7fd6e`.*
+*Documentación generada en Julio 2026, ampliada en Agosto 2026 (panel de administración, configuración editable, supervisor del bot, streaming + citas por documento; migración a `gpt-oss-120b`; uso en tiempo real y deduplicación de notificaciones de riesgo por episodio; segunda capa de Términos y Condiciones tras el aviso de tratamiento de datos; retrieval híbrido denso+BM25 y eliminación del techo de recall — Config F). Verificada contra el código fuente al 31-ago-2026, commit `2b1e4c6`.*

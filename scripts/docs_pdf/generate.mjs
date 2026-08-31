@@ -9,7 +9,7 @@
  *   node generate.mjs --input ../../docs/OTRO_DOC.md --output ../../docs/OTRO_DOC.pdf
  *   node generate.mjs --header "Maternas RAG"
  *
- * Por defecto convierte docs/DOCUMENTACION.md -> docs/DOCUMENTACION.pdf
+ * Por defecto convierte docs/DOCUMENTACION_oss120b_20260831.md -> docs/DOCUMENTACION.pdf
  * (rutas relativas a la raíz del repo, dos niveles arriba de este script).
  *
  * No descarga Chromium: usa puppeteer-core apuntando al Chrome/Edge ya
@@ -54,7 +54,7 @@ const args = parseArgs(process.argv.slice(2));
 
 const inputPath = path.resolve(
   REPO_ROOT,
-  args.input || "docs/DOCUMENTACION.md"
+  args.input || "docs/DOCUMENTACION_oss120b_20260831.md"
 );
 const outputPath = path.resolve(
   REPO_ROOT,

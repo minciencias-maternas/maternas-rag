@@ -1705,7 +1705,7 @@ En etapas previas del desarrollo del proyecto sí se probó fine-tunear algunos 
 - **Infraestructura:** entrenar y luego servir en producción un modelo fine-tuneado requiere GPU dedicada tanto para el entrenamiento como para la inferencia — capacidad que excede la disponible para este proyecto.
 - **Costo computacional:** el cómputo de entrenar y mantener un modelo propio es significativamente mayor que el de consumir modelos ya entrenados vía API, sin que la ganancia de calidad esperada justifique ese costo frente al enfoque de retrieval adoptado.
 
-Esto mantiene el sistema reproducible y operable sin infraestructura de entrenamiento propia. Ver también la fila "Sin fine-tuning" en la tabla de decisiones técnicas de `docs/DOCUMENTACION_oss120b_20260824.md` (§16).
+Esto mantiene el sistema reproducible y operable sin infraestructura de entrenamiento propia. Ver también la fila "Sin fine-tuning" en la tabla de decisiones técnicas de `docs/DOCUMENTACION_oss120b_20260831.md` (§16).
 
 ---
 
